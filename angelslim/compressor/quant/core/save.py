@@ -37,6 +37,30 @@ from .quant_func import Int8PerChannelQuantizer, fake_quant_dequant, weight_dequ
 __all__ = ["PTQvLLMSaveHF"]
 
 
+def sanitize_generation_config(generation_config):
+    """Enable do_sample when sampling params are set, so strict save-time
+    GenerationConfig validation passes (e.g. GLM-5 ships top_p without do_sample).
+    """
+    if generation_config is None:
+        return
+    if getattr(generation_config, "do_sample", False):
+        return
+    top_p = getattr(generation_config, "top_p", None)
+    top_k = getattr(generation_config, "top_k", None)
+    temperature = getattr(generation_config, "temperature", None)
+    sampling_intent = (
+        (top_p is not None and top_p < 1.0)
+        or (top_k is not None and top_k != 0)
+        or (temperature is not None and temperature != 1.0)
+    )
+    if sampling_intent:
+        generation_config.do_sample = True
+        print_info(
+            "Set generation_config.do_sample=True to match sampling params "
+            "(top_p/top_k/temperature) for strict save-time validation."
+        )
+
+
 class PTQSaveBase(metaclass=ABCMeta):
     def __init__(self, quant_model):
         self.quant_model = quant_model
@@ -294,7 +318,9 @@ class PTQSaveVllmHF(PTQSaveBase):
         print_info("Save quantization_config: {}".format(quant_dict))
 
         os.makedirs(save_path, exist_ok=True)
-        self.quant_model.get_model().save_pretrained(save_path, max_shard_size="5GB")
+        model_to_save = self.quant_model.get_model()
+        sanitize_generation_config(getattr(model_to_save, "generation_config", None))
+        model_to_save.save_pretrained(save_path, max_shard_size="5GB")
 
         with open(os.path.join(save_path, "hf_quant_config.json"), "w") as f:
             json.dump(trtllm_config, f, indent=4)

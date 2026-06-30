@@ -710,6 +710,31 @@ class GPTQ:
     def _drop_non_persistent_gptq_buffers(self, state_dict):
         return {k: v for k, v in state_dict.items() if not k.endswith(".g_idx")}
 
+    @staticmethod
+    def _sanitize_generation_config(generation_config):
+        """Enable do_sample when sampling params are set, so strict save-time
+        GenerationConfig validation passes (e.g. GLM-5 ships top_p without do_sample).
+        """
+        if generation_config is None:
+            return
+        do_sample = getattr(generation_config, "do_sample", False)
+        if do_sample:
+            return
+        top_p = getattr(generation_config, "top_p", None)
+        top_k = getattr(generation_config, "top_k", None)
+        temperature = getattr(generation_config, "temperature", None)
+        sampling_intent = (
+            (top_p is not None and top_p < 1.0)
+            or (top_k is not None and top_k != 0)
+            or (temperature is not None and temperature != 1.0)
+        )
+        if sampling_intent:
+            generation_config.do_sample = True
+            print_info(
+                "Set generation_config.do_sample=True to match sampling params "
+                "(top_p/top_k/temperature) for strict save-time validation."
+            )
+
     def _patch_saved_hyv3_config_for_serving(self, save_dir):
         config_path = os.path.join(save_dir, "config.json")
         if not os.path.exists(config_path):
@@ -718,7 +743,7 @@ class GPTQ:
         with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
 
-        if config.get("model_type") != "hy_v3":
+        if config.get("model_type") not in ("hy_v3", "glm_moe_dsa"):
             return
 
         rope_parameters = config.get("rope_parameters")
@@ -790,6 +815,7 @@ class GPTQ:
                 "true_sequential": True,
             }
         self.model.model.config.save_pretrained(save_dir, state_dict=EmptyModule().state_dict())
+        self._sanitize_generation_config(self.model.model.generation_config)
         self.model.model.generation_config.save_pretrained(save_dir)
 
         default_paths = [
