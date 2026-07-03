@@ -30,6 +30,7 @@ from .....utils import (
     find_parent_layer_and_sub_name,
     print_info,
 )
+from ...core.save import copy_mtp_layers_if_present
 from ...modules.catcher import Catcher
 from ...modules.helper_layer import (
     GPTQQuantLinear,
@@ -836,6 +837,12 @@ class GPTQ:
         )
         self.model.model.config.to_json_file(os.path.join(save_dir, "config.json"))
         self._patch_saved_hyv3_config_for_serving(save_dir)
+
+        copy_mtp_layers_if_present(
+            ori_model_path=getattr(self.model.model.config, "_name_or_path", None),
+            save_path=save_dir,
+            num_hidden_layers=self.model.model.config.num_hidden_layers,
+        )
 
         if self.modal_type == "VLM" and self.model.processor is not None:
             self.model.processor.save_pretrained(save_dir)
