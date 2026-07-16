@@ -650,9 +650,26 @@ class GPTQ:
         print_info("Packing NVFP4 model...")
         layers = find_layers(model, layers=self.model.observer_layer_classes)
 
+
+        try:
+            import ctypes
+
+            _libc = ctypes.CDLL("libc.so.6")
+
+            def _malloc_trim():
+                try:
+                    _libc.malloc_trim(0)
+                except Exception:
+                    pass
+
+        except Exception:
+            def _malloc_trim():
+                pass
+
         with tctl.threadpool_limits(limits=1):
-            pbar = tqdm(self.quantizers.keys(), leave=True)
-            for name in pbar:
+            names = list(self.quantizers.keys())
+            pbar = tqdm(names, leave=True)
+            for step, name in enumerate(pbar):
                 pbar.set_description(f"Packing {name}...", refresh=True)
                 if name not in layers:
                     continue
@@ -670,6 +687,19 @@ class GPTQ:
                 )
                 parent_layer, sub_name = find_parent_layer_and_sub_name(model, name)
                 setattr(parent_layer, sub_name, qdq_module)
+
+                del sub_layer, block_scale_e4m3, _zero, weight_scale_2
+                layers.pop(name, None)
+                self.quantizers.pop(name, None)
+                self.nvfp4_weight_scales_2.pop(name, None)
+
+                # gc/trim are not free; run them periodically, not every layer.
+                if (step + 1) % 64 == 0:
+                    gc.collect()
+                    _malloc_trim()
+
+        gc.collect()
+        _malloc_trim()
         print_info("NVFP4 model packed.")
 
     def convert(self):
