@@ -288,11 +288,14 @@ class GLM5_1(BaseLLMModel):
         Must run before init_ptq() so find_layers() can discover the per-expert
         nn.Linear modules and register them with the PTQ hook.
         """
-        for name, module in tuple(self.model.named_modules()):
-            if isinstance(module, GlmExpertsWithLinear):
-                continue
-            if not _is_glm_naive_moe(module):
-                continue
+        from tqdm import tqdm
+
+        moe_modules = [
+            (name, module)
+            for name, module in self.model.named_modules()
+            if not isinstance(module, GlmExpertsWithLinear) and _is_glm_naive_moe(module)
+        ]
+        for name, module in tqdm(moe_modules, desc="Replacing MoE layers"):
             parent_layer, sub_name = find_parent_layer_and_sub_name(self.model, name)
             moe_linear = GlmExpertsWithLinear(module)
             self._configure_linearized_expert_parallel(moe_linear, name)

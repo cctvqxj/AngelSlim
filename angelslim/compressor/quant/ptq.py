@@ -355,16 +355,20 @@ class PTQ:
             if is_nvfp4_weight_only:
                 # Populate weight_observer_amax_dict for fuse_observer_amax in weight-only mode
                 self.quant_model.weight_observer_amax_dict = {}
-                for name, sub_layer in self.ptq_hook.quant_layers_dict.items():
+                total_layers = len(self.ptq_hook.quant_layers_dict)
+                for idx, (name, sub_layer) in enumerate(self.ptq_hook.quant_layers_dict.items()):
                     weight = sub_layer.weight.detach()
                     self.quant_model.weight_observer_amax_dict[name] = weight.abs().max()
+                    if (idx + 1) % 10 == 0 or (idx + 1) == total_layers:
+                        print_info(f"[weight_observer_amax] {idx + 1}/{total_layers} layers done.")
             else:
                 self.quant_model.get_observer_values()
         # 2. insert qdq module
 
         pack_on_gpu = not self.quant_model.quant_config.cpu_convert and torch.cuda.is_available()
         pack_device = decide_device_for_distributed() if pack_on_gpu else None
-        for name, sub_layer in self.ptq_hook.quant_layers_dict.items():
+        total_convert_layers = len(self.ptq_hook.quant_layers_dict)
+        for convert_idx, (name, sub_layer) in enumerate(self.ptq_hook.quant_layers_dict.items()):
             parent_layer, sub_name = find_parent_layer_and_sub_name(quant_convert_module, name)
 
             if self.quant_model.quant_config.cpu_convert:
@@ -391,6 +395,9 @@ class PTQ:
 
             if qdq_module is not sub_layer:
                 setattr(parent_layer, sub_name, qdq_module)
+
+            if (convert_idx + 1) % 10 == 0 or (convert_idx + 1) == total_convert_layers:
+                print_info(f"[convert/qdq] {convert_idx + 1}/{total_convert_layers} layers done.")
 
         # 3. insert moe qdq module
         # For qwen3_vl_moe models, we need to insert MoEQDQModule for MOE experts,
