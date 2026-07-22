@@ -1,0 +1,9 @@
+method: rtn
+grid: g4
+model_path: /root/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0
+output_path: ./output/fixed_grid_rtn_g4
+block_size: 16
+level2_scale: max_abs_weight_over_6x256
+level2_scale_max: 256
+share_gate_up_weight_scale_2: true
+seed: 965

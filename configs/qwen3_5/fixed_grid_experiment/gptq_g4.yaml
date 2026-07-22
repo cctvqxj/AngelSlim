@@ -1,0 +1,41 @@
+# Controlled fixed-grid experiment: GPTQ + fixed E2M1 G4 (no adaptive selector).
+global:
+  save_path: ./output/fixed_grid_gptq_g4
+model:
+  name: Qwen3_5
+  model_path: /root/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0
+  trust_remote_code: true
+  low_cpu_mem_usage: true
+  use_cache: false
+  torch_dtype: auto
+  device_map: cpu
+  enable_expert_parallel: true
+compression:
+  name: PTQ
+  quantization:
+    name: nvfp4_gptq
+    bits: 4
+    quant_method:
+      weight: per-group
+      group_size: 16
+      dequant_to_bf16: false
+      actorder: false
+      four_over_six: false
+      fixed_grid: g4
+      level2_scale_max: 256
+      share_gate_up_weight_scale_2: true
+    ignore_layers:
+      - lm_head
+      - visual
+      - self_attn
+      - linear_attn
+      - mlp.gate
+      - mlp.shared_expert_gate
+      - mlp.shared_expert
+dataset:
+  name: TextDataset
+  data_path: ./dataset/wikitext_calib_applied.jsonl
+  max_seq_length: 2048
+  num_samples: 16
+  batch_size: 1
+  shuffle: false
