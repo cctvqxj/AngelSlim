@@ -1,0 +1,39 @@
+# Global configuration of pipeline
+global:
+  save_path: /apdcephfs_hldy2/share_300532381/xiaojingqi/glm/GLM-5-1-nvfp4-weight-only
+
+# Simplified Configuration for LLM compression
+model:
+  name: GLM5_1
+  # IMPORTANT: this must be the BF16 checkpoint produced by
+  #   tools/dequantize_glm5_fp8_to_bf16.py
+  # (the original GLM-5 release is FP8 block-quantized).
+  model_path: /apdcephfs_hldy2/share_300532381/hunyuan/common/44B-moe/series_1199/global_step0
+  trust_remote_code: true
+  low_cpu_mem_usage: true
+  use_cache: false
+  torch_dtype: auto
+  # Keep the full bf16 model resident on CPU (1.4TB; the 2.2TB host RAM holds it).
+  # Loading never touches the GPUs, so there is no load-time CUDA OOM. Per-layer
+  # NVFP4 packing is done on GPU (see cpu_convert below).
+  device_map: cpu
+
+# Compression configuration
+compression:
+  name: PTQ
+  quantization:
+    name: nvfp4_weight_only   # data-free: scales computed directly from weights
+    bits: 4
+    cpu_convert: false
+    quant_method:
+      weight: "per-group"
+      group_size: 16
+      dequant_to_bf16: false
+    ignore_layers:            # Quantize routed experts only; skip everything else.
+      - "lm_head"
+      - "self_attn"             # all MLA projections + DSA indexer
+      - "mlp.gate"              # MoE router
+      - "mlp.shared_experts"    # shared expert MLP
+      - "model.layers.0.mlp"    # leading dense MLP layers (first_k_dense_replace = 3)
+      - "model.layers.1.mlp"
+      - "model.layers.2.mlp"

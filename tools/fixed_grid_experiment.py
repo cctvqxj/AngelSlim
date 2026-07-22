@@ -145,10 +145,11 @@ def _update_code_stats(
     block_scale: torch.Tensor,
     raw_block_scale: torch.Tensor | None = None,
 ) -> None:
-    values = nvfp4_dequantize_grid(code, stats["grid"], dtype=torch.float32)
+    payload_grid = "g6" if stats["grid"] == "adaptive46" else stats["grid"]
+    values = nvfp4_dequantize_grid(code, payload_grid, dtype=torch.float32)
     abs_values = values.abs()
     stats["code_count"] += code.numel()
-    target = {"g6": 6.0, "g4": 4.0, "gint": 7.0}[stats["grid"]]
+    target = {"g6": 6.0, "g4": 4.0, "gint": 7.0, "adaptive46": 6.0}[stats["grid"]]
     stats["target_code_count"] += int((abs_values == target).sum().item())
     if stats["grid"] == "g4":
         stats["g4_code6_count"] += int((abs_values == 6.0).sum().item())
@@ -346,7 +347,8 @@ def _decode_weight(
     dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     code = unpack_nvfp4_fixed_grid_codes(packed)
-    values = nvfp4_dequantize_grid(code, grid, dtype=torch.float32)
+    payload_grid = "g6" if grid == "adaptive46" else grid
+    values = nvfp4_dequantize_grid(code, payload_grid, dtype=torch.float32)
     dequant = values.view(values.shape[0], -1, BLOCK_SIZE)
     dequant = dequant * (block_scale.float() * scale2.float()).unsqueeze(-1)
     return dequant.reshape(values.shape).to(dtype), code
@@ -454,7 +456,7 @@ def _eval_wikitext2(
 def command_evaluate(args: argparse.Namespace) -> None:
     from transformers import AutoModelForImageTextToText, AutoTokenizer
 
-    grid = normalize_nvfp4_grid(args.grid)
+    grid = "adaptive46" if args.grid == "adaptive46" else normalize_nvfp4_grid(args.grid)
     tensors = _load_experiment_tensors(args.checkpoint)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     model = AutoModelForImageTextToText.from_pretrained(
@@ -771,6 +773,611 @@ def command_archive(args: argparse.Namespace) -> None:
     print(f"Archived final scripts, sanity log, diff, and status under {root}")
 
 
+PREFERENCE_MARGIN_BINS = (
+    -1.0,
+    -0.5,
+    -0.2,
+    -0.1,
+    -0.05,
+    -0.01,
+    0.0,
+    0.01,
+    0.05,
+    0.1,
+    0.2,
+    0.5,
+    1.000001,
+)
+SECOND_MAX_BINS = (
+    0.0,
+    0.5,
+    2.0 / 3.0,
+    0.75,
+    5.0 / 6.0,
+    0.875,
+    0.95,
+    1.000001,
+)
+
+
+def _new_preference_accumulator() -> dict[str, Any]:
+    return {
+        "block_count": 0,
+        "g4_wins": 0,
+        "g6_wins": 0,
+        "ties": 0,
+        "error_g4": 0.0,
+        "error_g6": 0.0,
+        "error_oracle46": 0.0,
+        "weight_sq": 0.0,
+        "margin_hist": [0] * (len(PREFERENCE_MARGIN_BINS) - 1),
+        "second_max_bins": [
+            {
+                "block_count": 0,
+                "g4_wins": 0,
+                "error_g4": 0.0,
+                "error_g6": 0.0,
+            }
+            for _ in range(len(SECOND_MAX_BINS) - 1)
+        ],
+        "near_max_count": [{"block_count": 0, "g4_wins": 0} for _ in range(BLOCK_SIZE + 1)],
+    }
+
+
+def _update_preference_accumulator(
+    acc: dict[str, Any],
+    blocks: torch.Tensor,
+    error_g4: torch.Tensor,
+    error_g6: torch.Tensor,
+) -> None:
+    flat_blocks = blocks.reshape(-1, BLOCK_SIZE).float()
+    e4 = error_g4.reshape(-1).float()
+    e6 = error_g6.reshape(-1).float()
+    g4 = e4 < e6
+    ties = e4 == e6
+    count = e4.numel()
+    acc["block_count"] += count
+    acc["g4_wins"] += int(g4.sum().item())
+    acc["ties"] += int(ties.sum().item())
+    acc["g6_wins"] += count - int(g4.sum().item()) - int(ties.sum().item())
+    acc["error_g4"] += float(e4.sum().item())
+    acc["error_g6"] += float(e6.sum().item())
+    acc["error_oracle46"] += float(torch.minimum(e4, e6).sum().item())
+    acc["weight_sq"] += float((flat_blocks**2).sum().item())
+
+    margin = (e6 - e4) / (e6 + e4 + 1e-30)
+    margin_edges = torch.tensor(PREFERENCE_MARGIN_BINS[1:-1], device=margin.device)
+    margin_idx = torch.bucketize(margin, margin_edges)
+    hist = torch.bincount(margin_idx, minlength=len(PREFERENCE_MARGIN_BINS) - 1).cpu()
+    for index, value in enumerate(hist.tolist()):
+        acc["margin_hist"][index] += value
+
+    abs_blocks = flat_blocks.abs()
+    top2 = torch.topk(abs_blocks, k=2, dim=-1).values
+    second_ratio = torch.where(top2[:, 0] > 0, top2[:, 1] / top2[:, 0], 0)
+    ratio_edges = torch.tensor(SECOND_MAX_BINS[1:-1], device=second_ratio.device)
+    ratio_idx = torch.bucketize(second_ratio, ratio_edges)
+    for index in range(len(SECOND_MAX_BINS) - 1):
+        selected = ratio_idx == index
+        selected_count = int(selected.sum().item())
+        if selected_count == 0:
+            continue
+        entry = acc["second_max_bins"][index]
+        entry["block_count"] += selected_count
+        entry["g4_wins"] += int(g4[selected].sum().item())
+        entry["error_g4"] += float(e4[selected].sum().item())
+        entry["error_g6"] += float(e6[selected].sum().item())
+
+    max_abs = top2[:, 0]
+    relative = torch.where(max_abs[:, None] > 0, abs_blocks / max_abs[:, None], 0)
+    near_max = (relative >= (5.0 / 6.0)).sum(dim=-1)
+    near_hist = torch.bincount(near_max, minlength=BLOCK_SIZE + 1)
+    near_g4 = torch.bincount(near_max, weights=g4.float(), minlength=BLOCK_SIZE + 1)
+    for index in range(BLOCK_SIZE + 1):
+        acc["near_max_count"][index]["block_count"] += int(near_hist[index].item())
+        acc["near_max_count"][index]["g4_wins"] += int(near_g4[index].item())
+
+
+def _merge_preference_accumulator(target: dict[str, Any], source: dict[str, Any]) -> None:
+    for key in (
+        "block_count",
+        "g4_wins",
+        "g6_wins",
+        "ties",
+        "error_g4",
+        "error_g6",
+        "error_oracle46",
+        "weight_sq",
+    ):
+        target[key] += source[key]
+    for index, value in enumerate(source["margin_hist"]):
+        target["margin_hist"][index] += value
+    for target_entry, source_entry in zip(target["second_max_bins"], source["second_max_bins"]):
+        for key in ("block_count", "g4_wins", "error_g4", "error_g6"):
+            target_entry[key] += source_entry[key]
+    for target_entry, source_entry in zip(target["near_max_count"], source["near_max_count"]):
+        target_entry["block_count"] += source_entry["block_count"]
+        target_entry["g4_wins"] += source_entry["g4_wins"]
+
+
+def _finalize_preference_accumulator(acc: dict[str, Any]) -> dict[str, Any]:
+    result = dict(acc)
+    count = max(acc["block_count"], 1)
+    result["g4_win_fraction"] = acc["g4_wins"] / count
+    result["g6_win_fraction"] = acc["g6_wins"] / count
+    result["tie_fraction"] = acc["ties"] / count
+    result["nmse_g4"] = acc["error_g4"] / acc["weight_sq"]
+    result["nmse_g6"] = acc["error_g6"] / acc["weight_sq"]
+    result["nmse_oracle46"] = acc["error_oracle46"] / acc["weight_sq"]
+    result["oracle_error_reduction_vs_g6"] = (acc["error_g6"] - acc["error_oracle46"]) / acc[
+        "error_g6"
+    ]
+    result["oracle_error_reduction_vs_g4"] = (acc["error_g4"] - acc["error_oracle46"]) / acc[
+        "error_g4"
+    ]
+    result["margin_hist"] = [
+        {
+            "left": PREFERENCE_MARGIN_BINS[index],
+            "right": PREFERENCE_MARGIN_BINS[index + 1],
+            "block_count": value,
+            "fraction": value / count,
+        }
+        for index, value in enumerate(acc["margin_hist"])
+    ]
+    finalized_ratio = []
+    for index, entry in enumerate(acc["second_max_bins"]):
+        entry = dict(entry)
+        entry["left"] = SECOND_MAX_BINS[index]
+        entry["right"] = SECOND_MAX_BINS[index + 1]
+        denominator = max(entry["block_count"], 1)
+        entry["g4_win_fraction"] = entry["g4_wins"] / denominator
+        finalized_ratio.append(entry)
+    result["second_max_bins"] = finalized_ratio
+    result["near_max_count"] = [
+        {
+            **entry,
+            "count": index,
+            "g4_win_fraction": entry["g4_wins"] / max(entry["block_count"], 1),
+        }
+        for index, entry in enumerate(acc["near_max_count"])
+        if entry["block_count"] > 0
+    ]
+    return result
+
+
+@torch.no_grad()
+def _preference_projection(
+    weight: torch.Tensor,
+    scale2: torch.Tensor,
+    device: str,
+) -> tuple[
+    dict[str, Any],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    w = weight.to(device)
+    s2 = scale2.to(device).view(-1, 1, 1, 1)
+    blocks = w.view(w.shape[0], w.shape[1], -1, BLOCK_SIZE)
+    scale_g6 = compute_nvfp4_fixed_grid_block_scale(blocks, s2, "g6")
+    scale_g4 = compute_nvfp4_fixed_grid_block_scale(blocks, s2, "g4")
+    dq_g6 = nvfp4_fixed_grid_quant_dequant(blocks, scale_g6, s2, "g6")
+    dq_g4 = nvfp4_fixed_grid_quant_dequant(blocks, scale_g4, s2, "g4")
+    error_g6 = ((dq_g6 - blocks.float()) ** 2).sum(dim=-1)
+    error_g4 = ((dq_g4 - blocks.float()) ** 2).sum(dim=-1)
+    choose_g4 = error_g4 < error_g6
+    selected_scale = torch.where(choose_g4.unsqueeze(-1), scale_g4, scale_g6)
+    selected_dq = torch.where(choose_g4.unsqueeze(-1), dq_g4, dq_g6)
+    code = nvfp4_cast_to_grid(blocks.float() / (selected_scale.float() * s2), "g6").view_as(w)
+    packed = pack_nvfp4_fixed_grid_codes(code)
+
+    acc = _new_preference_accumulator()
+    _update_preference_accumulator(acc, blocks, error_g4, error_g6)
+    return (
+        acc,
+        packed.cpu(),
+        selected_scale.squeeze(-1).cpu(),
+        selected_dq.view_as(w).cpu(),
+    )
+
+
+def command_block_preference(args: argparse.Namespace) -> None:
+    model_path = args.model
+    output_path = Path(args.output)
+    checkpoint_path = output_path / "adaptive46_checkpoint"
+    checkpoint_path.mkdir(parents=True, exist_ok=True)
+    weight_map = json.loads(
+        (Path(model_path) / "model.safetensors.index.json").read_text(encoding="utf-8")
+    )["weight_map"]
+    all_acc = _new_preference_accumulator()
+    projection_acc = {
+        projection: _new_preference_accumulator()
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    }
+    layer_acc = {str(layer): _new_preference_accumulator() for layer in range(EXPECTED_LAYERS)}
+
+    for layer in tqdm(range(EXPECTED_LAYERS), desc="Block G4/G6 preference"):
+        gate_up_key = f"model.language_model.layers.{layer}.mlp.experts.gate_up_proj"
+        down_key = f"model.language_model.layers.{layer}.mlp.experts.down_proj"
+        gate_up = _load_original_tensor(model_path, weight_map, gate_up_key)
+        down = _load_original_tensor(model_path, weight_map, down_key)
+        half = gate_up.shape[1] // 2
+        gate = gate_up[:, :half, :].contiguous()
+        up = gate_up[:, half:, :].contiguous()
+        gate_up_amax = torch.maximum(
+            gate.float().abs().amax(dim=(1, 2)),
+            up.float().abs().amax(dim=(1, 2)),
+        )
+        gate_up_s2 = compute_nvfp4_fixed_grid_weight_scale_2(gate_up_amax, LEVEL2_SCALE_MAX)
+        down_s2 = compute_nvfp4_fixed_grid_weight_scale_2(
+            down.float().abs().amax(dim=(1, 2)), LEVEL2_SCALE_MAX
+        )
+        layer_tensors: dict[str, torch.Tensor] = {}
+
+        for projection, weight, scale2 in (
+            ("gate_proj", gate, gate_up_s2),
+            ("up_proj", up, gate_up_s2),
+            ("down_proj", down, down_s2),
+        ):
+            acc, packed, block_scale, dequant = _preference_projection(weight, scale2, args.device)
+            _merge_preference_accumulator(all_acc, acc)
+            _merge_preference_accumulator(projection_acc[projection], acc)
+            _merge_preference_accumulator(layer_acc[str(layer)], acc)
+            for expert in range(EXPECTED_EXPERTS):
+                key = _logical_key(layer, expert, projection)
+                layer_tensors[key] = packed[expert].contiguous()
+                layer_tensors[key.replace(".weight", ".weight_scale")] = block_scale[
+                    expert
+                ].contiguous()
+                layer_tensors[key.replace(".weight", ".weight_scale_2")] = (
+                    scale2[expert].float().clone().contiguous()
+                )
+            del packed, block_scale, dequant
+
+        save_file(
+            layer_tensors,
+            str(checkpoint_path / f"routed_experts_layer_{layer:02d}.safetensors"),
+            metadata={"format": "fixed_grid_v1", "grid": "adaptive46"},
+        )
+        del gate_up, down, gate, up, layer_tensors
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    result = {
+        "model_path": model_path,
+        "block_size": BLOCK_SIZE,
+        "level2_scale_formula": "max_abs(W)/(6*256)",
+        "preference_rule": "G4 iff block SSE(G4) < block SSE(G6); ties choose G6",
+        "all": _finalize_preference_accumulator(all_acc),
+        "projection": {
+            key: _finalize_preference_accumulator(value) for key, value in projection_acc.items()
+        },
+        "layer": {
+            key: _finalize_preference_accumulator(value) for key, value in layer_acc.items()
+        },
+        "adaptive_checkpoint": str(checkpoint_path),
+    }
+    _json_dump(result, output_path / "block_preference.json")
+    print(json.dumps(result["all"], indent=2))
+
+
+def command_preference_report(args: argparse.Namespace) -> None:
+    root = Path(args.root)
+    preference = json.loads((root / "block_preference.json").read_text(encoding="utf-8"))
+    adaptive = json.loads((root / "adaptive46_eval.json").read_text(encoding="utf-8"))
+    fixed_root = root.parent / "results"
+    fixed = {
+        grid: json.loads((fixed_root / f"rtn_{grid}.json").read_text(encoding="utf-8"))
+        for grid in ("g6", "g4", "gint")
+    }
+    overall = preference["all"]
+    adaptive_eval = adaptive["evaluation"]
+    adaptive_nmse = adaptive["weight_nmse"]["all"]["nmse"]
+
+    lines = [
+        "# 原始 BF16 blocks 的 G4/G6 固有偏好分析",
+        "",
+        "## 1. 分析定义",
+        "",
+        "- 暂不使用 GPTQ，只分析原始 BF16 routed-expert weights。",
+        "- 保持与固定-grid 实验相同的 block size 16、E4M3 block scale、",
+        "  `S=max_abs(W)/(6*256)` 和 gate/up level-2 sharing。",
+        "- 每个 block 分别执行真实 G4 和 G6 fake quant/dequant。",
+        "- 若 `SSE(G4)<SSE(G6)` 则记为 G4 偏好；相等记为 tie，并在 adaptive checkpoint 中选择 G6。",
+        "- 扫描范围为 30,720 tensors、2,013,265,920 blocks。",
+        "",
+        "## 2. 全局偏好分布",
+        "",
+        f"- G4 wins：**{overall['g4_win_fraction']:.6%}** " f"({overall['g4_wins']:,} blocks)。",
+        f"- G6 wins：**{overall['g6_win_fraction']:.6%}** " f"({overall['g6_wins']:,} blocks)。",
+        f"- Ties：**{overall['tie_fraction']:.6%}** " f"({overall['ties']:,} blocks)。",
+        "",
+        "这说明 block 偏好并非单一：虽然 G6 在 block 数量上占多数，仍有约 44.4% 的",
+        "blocks 在相同外围 scale 配置下使用 G4 能获得更低的 weight SSE。",
+        "",
+        "## 3. Weight error 与 oracle adaptive 4/6",
+        "",
+        "| Policy | Weight NMSE |",
+        "|---|---:|",
+        f"| Fixed G6 | {overall['nmse_g6']:.9f} |",
+        f"| Fixed G4 | {overall['nmse_g4']:.9f} |",
+        f"| Per-block SSE oracle 4/6 | {overall['nmse_oracle46']:.9f} |",
+        "",
+        f"- Oracle 相对固定 G6 减少 weight SSE："
+        f"**{overall['oracle_error_reduction_vs_g6']:.4%}**。",
+        f"- Oracle 相对固定 G4 减少 weight SSE："
+        f"**{overall['oracle_error_reduction_vs_g4']:.4%}**。",
+        "",
+        "## 4. Block 结构与 G4 偏好的关系",
+        "",
+        "### 4.1 第二大绝对值 / block 最大绝对值",
+        "",
+        "| Ratio interval | Blocks | G4 win rate |",
+        "|---|---:|---:|",
+    ]
+    for entry in overall["second_max_bins"]:
+        lines.append(
+            f"| [{entry['left']:.4f}, {entry['right']:.4f}) | "
+            f"{entry['block_count']:,} | {entry['g4_win_fraction']:.4%} |"
+        )
+    lines.extend(
+        [
+            "",
+            "G4 偏好在 second/max 位于 0.75–0.875 时明显升高到约 66%–69%。",
+            "该区域对应 G6 归一化后第二大值约为 4.5–5.25，正好覆盖 E2M1 在 4 与 6",
+            "之间缺少码点的区域。second/max 接近 1 时，两种策略重新接近均衡。",
+            "",
+            "### 4.2 处于 near-max 区域的元素数量",
+            "",
+            "near-max 定义为 `abs(w)/block_max >= 5/6`。",
+            "",
+            "| Near-max elements | Blocks | G4 win rate |",
+            "|---:|---:|---:|",
+        ]
+    )
+    for entry in overall["near_max_count"]:
+        if entry["count"] > 8:
+            continue
+        lines.append(
+            f"| {entry['count']} | {entry['block_count']:,} | " f"{entry['g4_win_fraction']:.4%} |"
+        )
+    lines.extend(
+        [
+            "",
+            "当 block 只有一个 near-max 元素时，G4 win rate 约 33.7%；有两个时约",
+            "50.8%；有三个及以上时进一步升高。这直接表明 block 内 near-max 分布是",
+            "决定 G4/G6 偏好的重要变量，单一全局 grid 会混合两类不同 blocks。",
+            "",
+            "## 5. Projection 与 layer",
+            "",
+            "| Projection | G4 wins | G6 wins | Ties | Oracle NMSE |",
+            "|---|---:|---:|---:|---:|",
+        ]
+    )
+    for projection, entry in preference["projection"].items():
+        lines.append(
+            f"| {projection} | {entry['g4_win_fraction']:.4%} | "
+            f"{entry['g6_win_fraction']:.4%} | {entry['tie_fraction']:.4%} | "
+            f"{entry['nmse_oracle46']:.9f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "gate/up/down 的 G4 偏好率都在约 44%–45%，说明异质性不是由单一 projection",
+            "独占。除 layer 0 有较高 tie 比例外，其余层的 G4 win rate 大多稳定在",
+            "约 44%–45%。完整逐层数据见 `block_preference.json`。",
+            "",
+            "## 6. Adaptive RTN 的 WikiText-2 结果",
+            "",
+            "| RTN policy | PPL | NLL | Actual decoded Weight NMSE |",
+            "|---|---:|---:|---:|",
+            f"| Fixed G6 | {fixed['g6']['evaluation']['ppl']:.6f} | "
+            f"{fixed['g6']['evaluation']['nll']:.9f} | "
+            f"{fixed['g6']['weight_nmse']['all']['nmse']:.9f} |",
+            f"| Fixed G4 | {fixed['g4']['evaluation']['ppl']:.6f} | "
+            f"{fixed['g4']['evaluation']['nll']:.9f} | "
+            f"{fixed['g4']['weight_nmse']['all']['nmse']:.9f} |",
+            f"| Fixed GINT | {fixed['gint']['evaluation']['ppl']:.6f} | "
+            f"{fixed['gint']['evaluation']['nll']:.9f} | "
+            f"{fixed['gint']['weight_nmse']['all']['nmse']:.9f} |",
+            f"| Per-block oracle 4/6 | **{adaptive_eval['ppl']:.6f}** | "
+            f"**{adaptive_eval['nll']:.9f}** | **{adaptive_nmse:.9f}** |",
+            "",
+            f"Oracle 4/6 相对 fixed G6 的 NLL 差为 "
+            f"`{adaptive_eval['nll'] - fixed['g6']['evaluation']['nll']:+.9f}`；",
+            f"相对 fixed G4 为 "
+            f"`{adaptive_eval['nll'] - fixed['g4']['evaluation']['nll']:+.9f}`。",
+            "",
+            "## 7. 结论",
+            "",
+            "1. 机械地全选 G4 或全选 G6 确实会掩盖显著的 block-level heterogeneity。",
+            "2. G6 虽然在约 54.8% blocks 上获胜且固定-grid全局 NMSE优于 G4，",
+            "   但约 44.4% blocks 明确偏好 G4。",
+            "3. G4 偏好与 block 内多个 near-max 元素、尤其 second/max 落在",
+            "   0.75–0.875 区间高度相关。",
+            "4. 仅用原始权重 SSE 做 per-block 选择，就将 RTN PPL 从 fixed G6 的",
+            f"   {fixed['g6']['evaluation']['ppl']:.4f} 改善到 " f"{adaptive_eval['ppl']:.4f}。",
+            "5. 该 selector 是 weight-SSE oracle，不代表任务级最优 selector；",
+            "   但它已经证明“不同 block 原本就适合不同 grid”不是边缘现象。",
+            "",
+            "本分析不包含 GPTQ，也不对 Hessian-aware selector 作推断。",
+        ]
+    )
+    output = root / "block_preference_report.md"
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Wrote {output}")
+
+
+def command_integrate_preference(args: argparse.Namespace) -> None:
+    root = Path(args.root)
+    main_report = root / "reports" / "experiment_report.md"
+    preference_root = root / "block_preference"
+    preference = json.loads(
+        (preference_root / "block_preference.json").read_text(encoding="utf-8")
+    )
+    adaptive = json.loads((preference_root / "adaptive46_eval.json").read_text(encoding="utf-8"))
+    fixed = {
+        grid: json.loads((root / "results" / f"rtn_{grid}.json").read_text(encoding="utf-8"))
+        for grid in ("g6", "g4", "gint")
+    }
+    overall = preference["all"]
+    marker = "\n## 10. 原始 BF16 blocks 的固有 G4/G6 偏好\n"
+    existing = main_report.read_text(encoding="utf-8")
+    if marker in existing:
+        existing = existing.split(marker, 1)[0].rstrip() + "\n"
+
+    section = [
+        "",
+        "## 10. 原始 BF16 blocks 的固有 G4/G6 偏好",
+        "",
+        "为确认固定 G4/G6 是否掩盖 block heterogeneity，额外在不使用 GPTQ 的",
+        "条件下扫描了全部原始 BF16 routed-expert weights：",
+        "",
+        f"- tensors：30,720；blocks：{overall['block_count']:,}。",
+        f"- G4 wins：**{overall['g4_win_fraction']:.6%}** " f"({overall['g4_wins']:,})。",
+        f"- G6 wins：**{overall['g6_win_fraction']:.6%}** " f"({overall['g6_wins']:,})。",
+        f"- ties：**{overall['tie_fraction']:.6%}** " f"({overall['ties']:,})。",
+        "",
+        "因此，固定 G4/G6 是有用的受控端点，但不能完整代表实际 block-wise scaling：",
+        "约 44.4% blocks 在完全相同的外围配置下具有更低的 G4 weight SSE。",
+        "",
+        "### 10.1 与 block 形状的关系",
+        "",
+        "- second-largest/max 位于 `[0.75, 0.833)` 时，G4 win rate 为 **66.21%**。",
+        "- second-largest/max 位于 `[0.833, 0.875)` 时，G4 win rate 为 **69.49%**。",
+        "- 该区域在 G6 归一化后对应约 4.5–5.25，覆盖 E2M1 的 4–6 码点空隙。",
+        "- near-max 元素数从 1 增至 4 时，G4 win rate 从 33.68% 升至 67.41%；",
+        "  说明多个 near-max 权重是 G4 偏好的强关联特征。",
+        "- gate/up/down 的 G4 win rate 均约为 44%–45%，现象并非由单一 projection 驱动。",
+        "",
+        "### 10.2 Per-block weight-SSE oracle 4/6",
+        "",
+        "| RTN policy | PPL | NLL | Decoded Weight NMSE |",
+        "|---|---:|---:|---:|",
+        f"| Fixed G6 | {fixed['g6']['evaluation']['ppl']:.6f} | "
+        f"{fixed['g6']['evaluation']['nll']:.9f} | "
+        f"{fixed['g6']['weight_nmse']['all']['nmse']:.9f} |",
+        f"| Fixed G4 | {fixed['g4']['evaluation']['ppl']:.6f} | "
+        f"{fixed['g4']['evaluation']['nll']:.9f} | "
+        f"{fixed['g4']['weight_nmse']['all']['nmse']:.9f} |",
+        f"| Fixed GINT | {fixed['gint']['evaluation']['ppl']:.6f} | "
+        f"{fixed['gint']['evaluation']['nll']:.9f} | "
+        f"{fixed['gint']['weight_nmse']['all']['nmse']:.9f} |",
+        f"| Per-block oracle 4/6 | **{adaptive['evaluation']['ppl']:.6f}** | "
+        f"**{adaptive['evaluation']['nll']:.9f}** | "
+        f"**{adaptive['weight_nmse']['all']['nmse']:.9f}** |",
+        "",
+        f"Oracle 4/6 相对 fixed G6 减少 weight SSE "
+        f"**{overall['oracle_error_reduction_vs_g6']:.2%}**，并使 NLL 变化为 "
+        f"`{adaptive['evaluation']['nll'] - fixed['g6']['evaluation']['nll']:+.9f}`。",
+        "",
+        "### 10.3 本阶段结论",
+        "",
+        "1. 机械地全部选择 G4 或 G6 会掩盖显著的 block-level heterogeneity。",
+        "2. G6 在 block 数量上占多数，但 G4 偏好 blocks 的规模足以产生实际模型收益。",
+        "3. 原始 weight-SSE selector 已使 RTN PPL 优于 fixed G4、G6 和 GINT。",
+        "4. 该结果只证明原始 block 偏好与简单 adaptive 4/6 的价值；",
+        "   它不是任务级最优 selector，也不包含 GPTQ/Hessian 结论。",
+        "",
+        "完整条件分桶、逐层和逐 projection 数据见：",
+        "",
+        "- `block_preference/block_preference_report.md`",
+        "- `block_preference/block_preference.json`",
+        "- `block_preference/adaptive46_eval.json`",
+        "",
+    ]
+    main_report.write_text(existing.rstrip() + "\n" + "\n".join(section), encoding="utf-8")
+    print(f"Integrated block-preference conclusions into {main_report}")
+
+
+def command_manifest(args: argparse.Namespace) -> None:
+    root = Path(args.root)
+    required = [
+        "reports/experiment_report.md",
+        "results/summary.json",
+        "block_preference/block_preference_report.md",
+        "block_preference/block_preference.json",
+        "block_preference/adaptive46_eval.json",
+        "calibration_sample_ids.json",
+        "run_commands.sh",
+        "code_changes.patch",
+        "logs/sanity_checks.log",
+    ]
+    files = []
+    for relative in required:
+        path = root / relative
+        if not path.exists():
+            raise FileNotFoundError(path)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        files.append(
+            {
+                "path": relative,
+                "size_bytes": path.stat().st_size,
+                "sha256": digest,
+            }
+        )
+    checkpoints = {}
+    for name, relative in {
+        "rtn_g6": "checkpoints/rtn_g6",
+        "rtn_g4": "checkpoints/rtn_g4",
+        "rtn_gint": "checkpoints/rtn_gint",
+        "gptq_g6": "checkpoints/gptq_g6/gptq_g6",
+        "gptq_g4": "checkpoints/gptq_g4/gptq_g4",
+        "gptq_gint": "checkpoints/gptq_gint/gptq_gint",
+        "rtn_adaptive46": "block_preference/adaptive46_checkpoint",
+    }.items():
+        directory = root / relative
+        tensors = sorted(directory.glob("*.safetensors"))
+        checkpoints[name] = {
+            "path": relative,
+            "safetensors_files": len(tensors),
+            "size_bytes": sum(path.stat().st_size for path in tensors),
+            "has_index": (directory / "model.safetensors.index.json").exists(),
+        }
+    manifest = {
+        "archive_root": str(root),
+        "created_utc": subprocess.run(
+            ["date", "-u", "+%FT%TZ"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip(),
+        "scope": (
+            "Fixed G6/G4/GINT RTN+GPTQ experiment plus original-BF16 "
+            "block-preference and RTN adaptive 4/6 analysis"
+        ),
+        "required_files": files,
+        "checkpoints": checkpoints,
+    }
+    _json_dump(manifest, root / "archive_manifest.json")
+    archive_text = [
+        "# Archive index",
+        "",
+        "This directory archives the complete controlled fixed-grid experiment and",
+        "the follow-up original-BF16 block-preference analysis.",
+        "",
+        "## Primary reports",
+        "",
+        "- `reports/experiment_report.md` — integrated main report.",
+        "- `block_preference/block_preference_report.md` — detailed block analysis.",
+        "- `results/summary.json` — six fixed-grid runs and GPTQ interactions.",
+        "- `archive_manifest.json` — sizes and SHA256 checksums for key artifacts.",
+        "",
+        "## Reproduction",
+        "",
+        "- `run_commands.sh` — fixed-grid commands.",
+        "- `configs/` — original experiment YAML files.",
+        "- `fixed_grid_experiment.py` — packing/evaluation/analysis implementation.",
+        "- `test_fixed_grid_experiment.py` and `logs/sanity_checks.log` — tests.",
+        "- `code_changes.patch` and `git_status.txt` — source snapshot context.",
+        "",
+        "Large checkpoint shards are listed by count and total size in the manifest;",
+        "they are not individually hashed to avoid rereading the full archive.",
+    ]
+    (root / "ARCHIVE.md").write_text("\n".join(archive_text) + "\n", encoding="utf-8")
+    print(f"Wrote archive manifest and index under {root}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -783,7 +1390,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     evaluate = sub.add_parser("evaluate")
     evaluate.add_argument("--checkpoint", required=True)
-    evaluate.add_argument("--grid", required=True, choices=("g6", "g4", "gint"))
+    evaluate.add_argument("--grid", required=True, choices=("g6", "g4", "gint", "adaptive46"))
     evaluate.add_argument("--method", required=True, choices=("rtn", "gptq"))
     evaluate.add_argument("--output", required=True)
     evaluate.add_argument("--model", default=DEFAULT_MODEL)
@@ -808,6 +1415,24 @@ def build_parser() -> argparse.ArgumentParser:
     archive = sub.add_parser("archive")
     archive.add_argument("--root", required=True)
     archive.set_defaults(func=command_archive)
+
+    preference = sub.add_parser("block-preference")
+    preference.add_argument("--model", default=DEFAULT_MODEL)
+    preference.add_argument("--output", required=True)
+    preference.add_argument("--device", default="cuda:0")
+    preference.set_defaults(func=command_block_preference)
+
+    preference_report = sub.add_parser("preference-report")
+    preference_report.add_argument("--root", required=True)
+    preference_report.set_defaults(func=command_preference_report)
+
+    integrate = sub.add_parser("integrate-preference")
+    integrate.add_argument("--root", required=True)
+    integrate.set_defaults(func=command_integrate_preference)
+
+    manifest = sub.add_parser("manifest")
+    manifest.add_argument("--root", required=True)
+    manifest.set_defaults(func=command_manifest)
     return parser
 
 
