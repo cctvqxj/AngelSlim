@@ -35,7 +35,10 @@ from ...modules.catcher import Catcher
 from ...modules.helper_layer import (
     GPTQQuantLinear,
     NVFP4QDQModule,
+    compute_nvfp4_fixed_grid_weight_scale_2,
     compute_nvfp4_weight_scale_2,
+    compute_nvfp4_weight_scale_2_fouroversix,
+    normalize_nvfp4_grid,
 )
 from .gptaq_module import GPTAQModule
 from .gptq_module import GPTQModule
@@ -81,6 +84,16 @@ class GPTQ:
         self.share_gate_up_weight_scale_2 = bool(
             self.model.quant_config.quant_algo_info.get("share_gate_up_weight_scale_2", True)
         )
+        self.four_over_six = bool(
+            self.model.quant_config.quant_algo_info.get("four_over_six", False)
+        )
+        fixed_grid = self.model.quant_config.quant_algo_info.get("fixed_grid")
+        self.fixed_grid = normalize_nvfp4_grid(fixed_grid) if fixed_grid is not None else None
+        self.level2_scale_max = float(
+            self.model.quant_config.quant_algo_info.get("level2_scale_max", 256.0)
+        )
+        if self.fixed_grid is not None and self.four_over_six:
+            raise ValueError("fixed_grid and adaptive four_over_six are mutually exclusive.")
         self.percdamp = 0.01
         self.sym = sym
         self.actorder = actorder
@@ -237,6 +250,31 @@ class GPTQ:
 
     def _forward_layer(self, layer, hidden_states, kwargs):
         hidden_states, kwargs = self._align_layer_input(hidden_states, kwargs)
+        # Qwen3.5 mixed-attention: linear_attention layers receive a 2D long mask,
+        # full_attention layers need a 4D float causal mask. Since Catcher captures
+        # kwargs from layer-0 (which may be linear_attention), we must fix the mask
+        # type for full_attention layers that use SDPA.
+        if "attention_mask" in kwargs and kwargs["attention_mask"] is not None:
+            mask = kwargs["attention_mask"]
+            if mask.dtype == torch.long and mask.dim() == 2:
+                # Check if this layer has causal (full) attention that needs float mask
+                self_attn = getattr(layer, "self_attn", None)
+                if self_attn is not None:
+                    seq_len = hidden_states.shape[1]
+                    bsz = hidden_states.shape[0]
+                    # Build a standard causal mask from the 2D attention_mask
+                    causal = torch.full(
+                        (seq_len, seq_len),
+                        torch.finfo(hidden_states.dtype).min,
+                        device=hidden_states.device,
+                        dtype=hidden_states.dtype,
+                    )
+                    causal = causal.triu(1)
+                    causal = causal[None, None, :, :].expand(bsz, 1, -1, -1)
+                    # Apply padding mask: where original mask==0, set to -inf
+                    pad_mask = mask[:, None, None, :] == 0
+                    causal = causal.masked_fill(pad_mask, torch.finfo(hidden_states.dtype).min)
+                    kwargs = {**kwargs, "attention_mask": causal}
         return _extract_hidden_states(layer(hidden_states=hidden_states, **kwargs))
 
     @staticmethod
@@ -358,7 +396,14 @@ class GPTQ:
                 # amax fasterquant would otherwise use per-layer.
                 w_amax = self.gptq[name].w.abs().amax().to(torch.float32)
                 group_amax = w_amax if group_amax is None else torch.maximum(group_amax, w_amax)
-            shared_scale_2 = compute_nvfp4_weight_scale_2(group_amax)
+            if self.fixed_grid is not None:
+                shared_scale_2 = compute_nvfp4_fixed_grid_weight_scale_2(
+                    group_amax, self.level2_scale_max
+                )
+            elif self.four_over_six:
+                shared_scale_2 = compute_nvfp4_weight_scale_2_fouroversix(group_amax)
+            else:
+                shared_scale_2 = compute_nvfp4_weight_scale_2(group_amax)
             for name in names:
                 self.gptq[name].weight_scale_2 = shared_scale_2.to(self.gptq[name].dev)
             print_info(
@@ -438,6 +483,9 @@ class GPTQ:
                         quant_bits=self.quant_bits,
                         weight_format=self.weight_format,
                         block_size=self.block_size,
+                        four_over_six=self.four_over_six,
+                        fixed_grid=self.fixed_grid,
+                        level2_scale_max=self.level2_scale_max,
                     )
 
             def pre_process_fwd_hook(layer_name):
@@ -494,17 +542,6 @@ class GPTQ:
 
             for name in self.gptq:
                 if any(ignore in name for ignore in self.ignore_layers):
-                    continue
-                if (
-                    self._is_distributed_expert_parallel()
-                    and self._get_expert_idx_from_name(name) is not None
-                    and self.gptq[name].nsamples == 0
-                ):
-                    print_info(
-                        f"Skip {name} because no calibration samples were "
-                        f"routed to this local expert layer."
-                    )
-                    self.gptq[name].free()
                     continue
                 print_info(f"Quant {name} ,nsamples: {self.gptq[name].nsamples}...")
                 prev_names = self.get_actorder_prev_names(name, subset)
@@ -667,6 +704,7 @@ class GPTQ:
                     bias=sub_layer.bias,
                     block_size=self.block_size,
                     input_scale=None,
+                    fixed_grid=self.fixed_grid,
                 )
                 parent_layer, sub_name = find_parent_layer_and_sub_name(model, name)
                 setattr(parent_layer, sub_name, qdq_module)
@@ -702,10 +740,23 @@ class GPTQ:
         )
 
     def _collect_local_expert_state_dict(self, state_dict):
+        # Determine local expert range from quantizers
+        local_expert_ids = set()
+        for name in self.quantizers:
+            eidx = self._get_expert_idx_from_name(name)
+            if eidx is not None:
+                local_expert_ids.add(eidx)
+
+        def _is_local_expert(key):
+            if ".mlp.experts." not in key:
+                return False
+            eidx = self._get_expert_idx_from_name(key)
+            return eidx is not None and eidx in local_expert_ids
+
         return {
             k: v.cpu()
             for k, v in state_dict.items()
-            if ".mlp.experts." in k and not k.endswith(".g_idx")
+            if _is_local_expert(k) and not k.endswith(".g_idx")
         }
 
     def _drop_non_persistent_gptq_buffers(self, state_dict):
@@ -841,7 +892,10 @@ class GPTQ:
         copy_mtp_layers_if_present(
             ori_model_path=getattr(self.model.model.config, "_name_or_path", None),
             save_path=save_dir,
-            num_hidden_layers=self.model.model.config.num_hidden_layers,
+            num_hidden_layers=getattr(self.model.model.config, "num_hidden_layers", None)
+            or getattr(
+                getattr(self.model.model.config, "text_config", None), "num_hidden_layers", None
+            ),
         )
 
         if self.modal_type == "VLM" and self.model.processor is not None:
@@ -875,7 +929,15 @@ class GPTQ:
         dist.barrier()
 
         if rank == 0:
-            merged_state_dict = dict(state_dict)
+            # Start with rank 0's full state, then remove non-local expert keys
+            # (they weren't converted by rank 0 and are stale bf16 originals)
+            merged_state_dict = {
+                k: v
+                for k, v in state_dict.items()
+                if ".mlp.experts." not in k or k in local_expert_state_dict
+            }
+            # Add rank 0's local expert state (already in merged_state_dict)
+            # Then overlay other ranks' converted expert states
             for other_rank in range(1, world_size):
                 expert_state_path = os.path.join(tmp_dir, f"rank{other_rank}.pt")
                 expert_state_dict = torch.load(

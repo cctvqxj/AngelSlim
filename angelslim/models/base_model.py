@@ -265,6 +265,7 @@ class BaseLLMModel(metaclass=ABCMeta):
                 bias=sub_layer.bias,
                 block_size=block_size,
                 input_scale=act_scale,
+                fixed_grid=self.quant_config.quant_algo_info.get("fixed_grid"),
             )
         else:
             print_info("current {} deploy_backend not support".format(self.deploy_backend))

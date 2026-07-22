@@ -136,8 +136,11 @@ class TextDataset(BaseDataset):
                 # template / thinking-mode logic below.
                 if "applied_message" in data:
                     text = data["applied_message"]
-                    model_inputs = self.processor(
-                        text=[text],
+                    # Use the underlying tokenizer (not the full multimodal
+                    # processor) to avoid image/video detection on plain text.
+                    _tokenizer = getattr(self.processor, "tokenizer", self.processor)
+                    model_inputs = _tokenizer(
+                        text,
                         return_tensors="pt",
                         max_length=self.max_length,
                         truncation=True,

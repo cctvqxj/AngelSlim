@@ -15,6 +15,11 @@
 import torch
 
 from .....utils import print_info
+from ..helper_layer import (
+    compute_nvfp4_fixed_grid_block_scale,
+    compute_nvfp4_fixed_grid_weight_scale_2,
+    normalize_nvfp4_grid,
+)
 
 __all__ = ["NVFP4"]
 
@@ -32,6 +37,16 @@ class NVFP4:
         self.model = model
         self.block_size = self.model.quant_config.quant_algo_info["block_size"]
         self.weight_only = self.model.quant_config.quant_algo_info.get("weight_only", False)
+        self.four_over_six = bool(
+            self.model.quant_config.quant_algo_info.get("four_over_six", False)
+        )
+        fixed_grid = self.model.quant_config.quant_algo_info.get("fixed_grid")
+        self.fixed_grid = normalize_nvfp4_grid(fixed_grid) if fixed_grid is not None else None
+        self.level2_scale_max = float(
+            self.model.quant_config.quant_algo_info.get("level2_scale_max", 256.0)
+        )
+        if self.fixed_grid is not None and self.four_over_six:
+            raise ValueError("fixed_grid and adaptive four_over_six are mutually exclusive.")
 
     @torch.no_grad()
     def run(self, dataloader=None):
@@ -54,7 +69,13 @@ class NVFP4:
 
     def get_weights_scaling_factor_2(self, weight_observer_amax):
         """Returns per tensor weight scaling factor."""
-        return weight_observer_amax.float() / 6.0 / 448.0
+        if self.fixed_grid is not None:
+            return compute_nvfp4_fixed_grid_weight_scale_2(
+                weight_observer_amax, self.level2_scale_max
+            )
+        scale_max = 256.0 if self.four_over_six else 448.0
+        scale_2 = weight_observer_amax.float() / 6.0 / scale_max
+        return torch.where(scale_2 > 0, scale_2, torch.ones_like(scale_2))
 
     def get_weights_scaling_factor(
         self,
@@ -75,6 +96,40 @@ class NVFP4:
         ), "Weight shape is not divisible for block size for block quantiation."
 
         weight = weight.reshape((*tuple(weight.shape[:-2]), n, k // block_size, block_size))
+        if self.fixed_grid is not None:
+            return compute_nvfp4_fixed_grid_block_scale(
+                weight,
+                weights_scaling_factor_2,
+                self.fixed_grid,
+                keep_high_precision=keep_high_precision,
+            ).squeeze(-1)
+        if self.four_over_six:
+            # Reuse the exact fake-quant primitives used by GPTQ/AWQ search,
+            # then store the winning E4M3 block scale for each block.
+            from ..helper_layer import (
+                compute_nvfp4_block_scale_fouroversix,
+                nvfp4_quant_dequant,
+            )
+
+            blocks = weight
+            eff_scale_6, eff_scale_4 = compute_nvfp4_block_scale_fouroversix(
+                blocks, weights_scaling_factor_2, keep_high_precision=keep_high_precision
+            )
+            dq6 = nvfp4_quant_dequant(blocks, eff_scale_6)
+            dq4 = nvfp4_quant_dequant(blocks, eff_scale_4)
+            err6 = ((dq6 - blocks.float()) ** 2).sum(dim=-1)
+            err4 = ((dq4 - blocks.float()) ** 2).sum(dim=-1)
+            selected_eff_scale = torch.where(
+                (err4 < err6).unsqueeze(-1), eff_scale_4, eff_scale_6
+            ).squeeze(-1)
+            q_per_block_scale = selected_eff_scale / weights_scaling_factor_2
+            if not keep_high_precision:
+                finfo = torch.finfo(torch.float8_e4m3fn)
+                q_per_block_scale = q_per_block_scale.clamp(min=finfo.min, max=finfo.max).to(
+                    torch.float8_e4m3fn
+                )
+            return q_per_block_scale
+
         # Get per block amax
         per_block_amax = weight.abs().amax(dim=-1).float()
         # Get per-block-scale

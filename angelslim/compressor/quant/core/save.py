@@ -229,8 +229,8 @@ class PTQVLMSaveVllmHF(PTQSaveBase):
         save_name = self.quant_model.quant_config.save_name
         ignore_field = "ignore" if save_name == "compressed-tensors" else "ignored_layers"
 
-        w_quant_algo = self.quant_model.quant_config.quant_algo_info["w"]
-        a_quant_algo = self.quant_model.quant_config.quant_algo_info["a"]
+        w_quant_algo = self.quant_model.quant_config.quant_algo_info.get("w", "")
+        a_quant_algo = self.quant_model.quant_config.quant_algo_info.get("a", "")
         is_dynamic = "dynamic" in a_quant_algo
         ignored_layers = self.quant_model.skip_layer_names()
 
@@ -275,12 +275,16 @@ class PTQVLMSaveVllmHF(PTQSaveBase):
             group_size = self.quant_model.quant_config.quant_algo_info["block_size"]
             trtllm_config["quantization"]["quant_algo"] = "NVFP4"
             trtllm_config["quantization"]["group_size"] = group_size
-            act_config = {
-                "num_bits": 4,
-                "group_size": group_size,
-                "dynamic": is_dynamic,
-                "type": "float",
-            }
+            act_config = (
+                None
+                if self.quant_model.quant_config.quant_algo_info.get("weight_only", False)
+                else {
+                    "num_bits": 4,
+                    "group_size": group_size,
+                    "dynamic": is_dynamic,
+                    "type": "float",
+                }
+            )
             weight_config = {
                 "num_bits": 4,
                 "group_size": group_size,

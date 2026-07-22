@@ -17,6 +17,7 @@ import os
 import warnings
 
 import torch
+import torch.distributed as dist
 from safetensors.torch import load_file
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeTextExperts
 
@@ -63,6 +64,7 @@ class PTQ:
         # and computes its scales directly from weights, so it must NOT install
         # the activation/weight observer hook even though "nvfp4" is in algo.
         is_gptq = "gptq" in self.quant_algo or "gptaq" in self.quant_algo
+        is_nvfp4_awq = "nvfp4" in self.quant_algo and "awq" in self.quant_algo
         if (
             "fp8" in self.quant_algo
             or "int8" in self.quant_algo
@@ -70,7 +72,14 @@ class PTQ:
         ):
             # Add ptq observer hook
             self.ptq_hook = PTQHook(self.quant_model)
-            self.ptq_hook.apply_hook()
+            if is_nvfp4_awq:
+                # AWQ performs many candidate forwards. Observer hooks would
+                # clone every input/output even though weight-only NVFP4 does
+                # not consume observer values. Keep only the target-layer map
+                # required by the generic NVFP4 conversion path.
+                self.ptq_hook.quant_layers_dict = self.quant_model.get_observer_layers()
+            else:
+                self.ptq_hook.apply_hook()
 
         if is_gptq:
             max_seq_length = self.quant_model.quant_config.max_seq_length
@@ -100,6 +109,10 @@ class PTQ:
                 observer_layer_classes=self.quant_model.observer_layer_classes,
                 low_memory=self.quant_model.quant_config.low_memory,
             )
+            if "nvfp4" in self.quant_algo:
+                # AWQ optimizes/applies channel scales; NVFP4 owns the final
+                # block-scale selection, packing, and checkpoint format.
+                self.nvfp4 = NVFP4(self.quant_model)
         elif "fp8" in self.quant_algo:
             max_seq_length = self.quant_model.quant_config.max_seq_length
             hidden_size = self.quant_model.quant_config.hidden_size
@@ -171,7 +184,7 @@ class PTQ:
             self.gptq.convert()
         elif "w4a8i8" in self.quant_algo:
             self.w4a8i8.convert()
-        elif "awq" in self.quant_algo:
+        elif "awq" in self.quant_algo and "nvfp4" not in self.quant_algo:
             self.awq.convert()
         elif "lepto" in self.quant_algo:
             self.fp8.convert()
@@ -187,6 +200,18 @@ class PTQ:
         """
         Save PTQ scales or ckpt.
         """
+        distributed_awq = (
+            "awq" in self.quant_algo
+            and dist.is_available()
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+        )
+        if distributed_awq:
+            dist.barrier()
+            if dist.get_rank() != 0:
+                dist.barrier()
+                return
+
         self.transform_runner.save()
 
         if (
@@ -216,11 +241,14 @@ class PTQ:
             self.gptq.save(save_path)
         elif "w4a8i8" in self.quant_algo:
             self.w4a8i8.save(save_path)
-        elif "awq" in self.quant_algo:
+        elif "awq" in self.quant_algo and "nvfp4" not in self.quant_algo:
             self.awq.save(save_path)
         else:
             save_func = self.quant_model.get_save_func()(self.quant_model)
             save_func.save(save_path)
+
+        if distributed_awq:
+            dist.barrier()
 
     def get_meta_weights_info(self, model):
         """Get detailed information of all meta weights."""

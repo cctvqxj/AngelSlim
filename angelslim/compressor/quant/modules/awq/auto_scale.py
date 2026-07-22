@@ -33,6 +33,10 @@ class AutoLayerScale:
         model_type="dense",
         observer_layer_classes=None,
         low_memory=False,
+        weight_format="int4",
+        four_over_six=False,
+        block_size=16,
+        scale_attention=True,
     ):
         """
         The implementation from AWQ(https://arxiv.org/pdf/2306.00978.pdf).
@@ -48,6 +52,7 @@ class AutoLayerScale:
         self.layer_count = 0
         self.observer_layer_classes = observer_layer_classes
         self.low_memory = low_memory
+        self.scale_attention = scale_attention
         self.search_function = AWQSearch(
             n_grid=n_grid,
             bits_length=weight_bits,
@@ -56,6 +61,9 @@ class AutoLayerScale:
             merge_samples=merge_samples,
             observer_layer_classes=observer_layer_classes,
             low_memory=low_memory,
+            weight_format=weight_format,
+            four_over_six=four_over_six,
+            block_size=block_size,
         )
 
     def apply_scale(self, module, scales_list, input_feat_dict=None):
@@ -125,6 +133,14 @@ class AutoLayerScale:
     def auto_scale(self, module, input_feat, cache):
         print_info("[auto scale] start")
 
+        def _get_moe_experts(experts):
+            if isinstance(experts, (torch.nn.ModuleList, list, tuple)):
+                return list(experts)
+            indexed_children = [
+                (int(name), child) for name, child in experts.named_children() if name.isdigit()
+            ]
+            return [child for _, child in sorted(indexed_children)]
+
         def _auto_get_scale(layer_name, prev_op, layers, inp, module2inspect=None, cache=None):
             if module2inspect is None:
                 assert len(layers) == 1
@@ -162,7 +178,9 @@ class AutoLayerScale:
 
         scales_list = []
         print_info(input_feat.keys())
-        if self.model_type == "deepseek_v3":
+        if not self.scale_attention:
+            print_info("[auto scale] attention scaling skipped by ignore_layers")
+        elif self.model_type == "deepseek_v3":
             scales_list.append(
                 _auto_get_scale(
                     layer_name="attn.qkv",
@@ -186,7 +204,7 @@ class AutoLayerScale:
                     inp=input_feat["self_attn.q_b_proj"],
                 )
             )
-        else:
+        elif hasattr(module, "self_attn"):
             scales_list.append(
                 _auto_get_scale(
                     layer_name="attn.qkv",
@@ -212,9 +230,12 @@ class AutoLayerScale:
                         inp=input_feat["self_attn.o_proj"],
                     )
                 )
+        else:
+            print_info("[auto scale] no supported attention module found; skipping attention")
 
         if hasattr(module.mlp, "gate"):
             print_info("auto scale -> MoeAWQ")
+            experts = _get_moe_experts(module.mlp.experts)
             if self.model_type == "hunyuan_v1_moe":
                 # share_mlp fc1
                 scales_list.append(
@@ -245,9 +266,7 @@ class AutoLayerScale:
                         layer_name="expert.gate_proj",
                         prev_op=module.post_attention_layernorm,
                         layers=[
-                            w
-                            for expert in module.mlp.experts
-                            for w in [expert.gate_proj, expert.up_proj]
+                            w for expert in experts for w in [expert.gate_proj, expert.up_proj]
                         ],
                         inp=input_feat["mlp"],
                         module2inspect=module.mlp,
@@ -255,13 +274,16 @@ class AutoLayerScale:
                     )
                 )
                 # fc2
-                for i, expert in enumerate(module.mlp.experts):
+                for i, expert in enumerate(experts):
+                    input_key = f"mlp.experts.{i}.down_proj"
+                    if input_key not in input_feat:
+                        continue
                     scales_list.append(
                         _auto_get_scale(
                             layer_name="mlp.down_proj",
                             prev_op=expert.up_proj,
                             layers=[expert.down_proj],
-                            inp=input_feat[f"mlp.experts.{i}.down_proj"],
+                            inp=input_feat[input_key],
                         )
                     )
             elif self.model_type == "deepseek_v3":
@@ -271,9 +293,7 @@ class AutoLayerScale:
                         layer_name="moe",
                         prev_op=module.post_attention_layernorm,
                         layers=[
-                            w
-                            for expert in module.mlp.experts
-                            for w in [expert.gate_proj, expert.up_proj]
+                            w for expert in experts for w in [expert.gate_proj, expert.up_proj]
                         ]
                         + [
                             module.mlp.shared_experts.gate_proj,
@@ -285,13 +305,16 @@ class AutoLayerScale:
                     )
                 )
                 # fc2
-                for i, expert in enumerate(module.mlp.experts):
+                for i, expert in enumerate(experts):
+                    input_key = f"mlp.experts.{i}.down_proj"
+                    if input_key not in input_feat:
+                        continue
                     scales_list.append(
                         _auto_get_scale(
                             layer_name=f"expert.{i}.down_proj",
                             prev_op=expert.up_proj,
                             layers=[expert.down_proj],
-                            inp=input_feat[f"mlp.experts.{i}.down_proj"].unsqueeze(0),
+                            inp=input_feat[input_key].unsqueeze(0),
                         )
                     )
                 scales_list.append(
@@ -311,9 +334,7 @@ class AutoLayerScale:
                         layer_name="expert.gate_proj",
                         prev_op=module.post_attention_layernorm,
                         layers=[
-                            w
-                            for expert in module.mlp.experts
-                            for w in [expert.gate_proj, expert.up_proj]
+                            w for expert in experts for w in [expert.gate_proj, expert.up_proj]
                         ],
                         inp=input_feat["mlp"],
                         module2inspect=module.mlp,
@@ -321,13 +342,16 @@ class AutoLayerScale:
                     )
                 )
                 # fc2
-                for i, expert in enumerate(module.mlp.experts):
+                for i, expert in enumerate(experts):
+                    input_key = f"mlp.experts.{i}.down_proj"
+                    if input_key not in input_feat:
+                        continue
                     scales_list.append(
                         _auto_get_scale(
                             layer_name="mlp.down_proj",
                             prev_op=expert.up_proj,
                             layers=[expert.down_proj],
-                            inp=input_feat[f"mlp.experts.{i}.down_proj"].unsqueeze(0),
+                            inp=input_feat[input_key].unsqueeze(0),
                         )
                     )
         else:

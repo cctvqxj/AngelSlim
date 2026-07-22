@@ -46,8 +46,55 @@ def _ensure_triton():
 
 @torch.no_grad()
 def pseudo_quantize_tensor(
-    w, w_bit=4, zero_point=True, q_group_size=-1, inplace=False, get_scale_zp=False
+    w,
+    w_bit=4,
+    zero_point=True,
+    q_group_size=-1,
+    inplace=False,
+    get_scale_zp=False,
+    weight_format="int4",
+    four_over_six=False,
+    block_size=16,
 ):
+    if weight_format == "nvfp4":
+        if get_scale_zp:
+            raise ValueError("NVFP4 fake quantization does not produce INT4 scale/zero-point.")
+        if inplace:
+            raise ValueError("NVFP4 fake quantization does not support inplace=True.")
+        if w.shape[-1] % block_size != 0:
+            raise ValueError(
+                f"NVFP4 block size {block_size} must divide the last dimension {w.shape[-1]}."
+            )
+
+        # Import lazily to avoid a core <-> helper_layer import cycle.
+        from ..modules.helper_layer import (
+            compute_nvfp4_block_scale,
+            compute_nvfp4_block_scale_fouroversix,
+            compute_nvfp4_weight_scale_2,
+            compute_nvfp4_weight_scale_2_fouroversix,
+            nvfp4_quant_dequant,
+            nvfp4_quant_dequant_fouroversix,
+        )
+
+        org_w_shape = w.shape
+        org_dtype = w.dtype
+        blocks = w.reshape(-1, block_size)
+        weight_amax = blocks.abs().amax()
+        if four_over_six:
+            weight_scale_2 = compute_nvfp4_weight_scale_2_fouroversix(weight_amax)
+            eff_scale_6, eff_scale_4 = compute_nvfp4_block_scale_fouroversix(
+                blocks, weight_scale_2
+            )
+            w = nvfp4_quant_dequant_fouroversix(blocks, eff_scale_6, eff_scale_4)
+        else:
+            weight_scale_2 = compute_nvfp4_weight_scale_2(weight_amax)
+            eff_scale = compute_nvfp4_block_scale(blocks, weight_scale_2)
+            w = nvfp4_quant_dequant(blocks, eff_scale)
+        return w.reshape(org_w_shape).to(org_dtype)
+
+    if weight_format != "int4":
+        raise ValueError(f"Unsupported fake-quant weight format: {weight_format}")
+
     org_w_shape = w.shape
     if q_group_size > 0:
         assert org_w_shape[-1] % q_group_size == 0

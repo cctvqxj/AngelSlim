@@ -143,6 +143,29 @@ class QuantConfig:
                 self.quant_algo_info["c"] = f"int8_{kv_cache_quant_method}"
             self.low_memory = config.quantization.low_memory
             self.quant_analyse = config.quantization.quant_analyse
+        elif "nvfp4_awq" in self.quant_algo:
+            self.act_observer = None
+            # The hook is still used to discover conversion targets. In
+            # weight-only mode its collected values are not consumed.
+            self.weight_observer = AbsmaxPertensorObserver
+            self.kv_cache_observer = None
+            block_size = (
+                16
+                if quantization_args.quant_method["group_size"] == -1
+                else quantization_args.quant_method["group_size"]
+            )
+            self.quant_algo_info = {
+                "zero_point": quantization_args.quant_method.get("zero_point", False),
+                "group_size": int(block_size),
+                "block_size": int(block_size),
+                "mse_range": quantization_args.quant_method.get("mse_range", False),
+                "ignore_layers": quantization_args.ignore_layers,
+                "weight_format": "nvfp4",
+                "weight_only": True,
+                "w": f"nvfp4_{weight_quant_method}",
+                "four_over_six": quantization_args.quant_method.get("four_over_six", False),
+            }
+            self.low_memory = config.quantization.low_memory
         elif "int4_awq" in self.quant_algo:
             self.act_observer = None
             self.weight_observer = None
@@ -204,6 +227,9 @@ class QuantConfig:
                     "share_gate_up_weight_scale_2", True
                 ),
                 "w": f"nvfp4_{weight_quant_method}",
+                "four_over_six": quantization_args.quant_method.get("four_over_six", False),
+                "fixed_grid": quantization_args.quant_method.get("fixed_grid"),
+                "level2_scale_max": quantization_args.quant_method.get("level2_scale_max", 256.0),
             }
         elif "nvfp4" in self.quant_algo:
             is_weight_only = "weight_only" in self.quant_algo
@@ -230,6 +256,8 @@ class QuantConfig:
                 "ignore_layers": quantization_args.ignore_layers,
                 "block_size": block_size,
                 "weight_only": is_weight_only,
+                "fixed_grid": quantization_args.quant_method.get("fixed_grid"),
+                "level2_scale_max": quantization_args.quant_method.get("level2_scale_max", 256.0),
             }
 
             if not is_weight_only and act_quant_method is not None:

@@ -44,6 +44,7 @@ class QuantizationMethod(str, Enum):
     FP8_BLOCKWISE = "fp8_blockwise"
     DAQ = "daq"
     INT4_AWQ = "int4_awq"
+    NVFP4_AWQ = "nvfp4_awq"
     INT4_GPTQ = "int4_gptq"
     INT8_DYNAMIC = "int8_dynamic"
     W4A8_FP8 = "w4a8_fp8"
@@ -118,7 +119,12 @@ class GlobalConfig:
     def set_model_hidden_size(self, model_path) -> int:
         json_data = get_hf_config(model_path)
         try:
-            if json_data["model_type"] in ["qwen3_vl", "qwen3_vl_moe"]:
+            if json_data["model_type"] in [
+                "qwen3_vl",
+                "qwen3_vl_moe",
+                "qwen3_5",
+                "qwen3_5_moe",
+            ]:
                 self.hidden_size = json_data["text_config"]["hidden_size"]
             elif (
                 json_data["architectures"][0]

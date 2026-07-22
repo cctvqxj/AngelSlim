@@ -21,15 +21,31 @@ from .....utils import get_tensor_item, print_info
 from ...core import compute_scales_with_zero
 from ..helper_layer import (
     compute_nvfp4_block_scale,
+    compute_nvfp4_block_scale_fouroversix,
+    compute_nvfp4_fixed_grid_block_scale,
+    compute_nvfp4_fixed_grid_weight_scale_2,
     compute_nvfp4_weight_scale_2,
+    compute_nvfp4_weight_scale_2_fouroversix,
+    normalize_nvfp4_grid,
+    nvfp4_fixed_grid_quant_dequant,
     nvfp4_quant_dequant,
+    nvfp4_quant_dequant_fouroversix,
 )
 
 __all__ = ["GPTQModule"]
 
 
 class GPTQModule:
-    def __init__(self, layer, quant_bits=4, weight_format="int4", block_size=16):
+    def __init__(
+        self,
+        layer,
+        quant_bits=4,
+        weight_format="int4",
+        block_size=16,
+        four_over_six=False,
+        fixed_grid=None,
+        level2_scale_max=256.0,
+    ):
         """
         GPTQ quantization wrapper for neural network layers.
 
@@ -39,6 +55,10 @@ class GPTQModule:
             weight_format: "int4" (default, uniform) or "nvfp4" (E2M1 grid +
                 two-level scale). Routes compute_quant_params / quant_dequant.
             block_size: NVFP4 micro-scaling block size (nvfp4 only).
+            four_over_six: If True, use adaptive 4/6 block scaling (nvfp4 only).
+            fixed_grid: Controlled fixed grid: ``g6``, ``g4``, or ``gint``.
+            level2_scale_max: Common level-2 denominator multiplier. The
+                controlled experiment fixes this to 256 for all three grids.
         """
         super(GPTQModule, self).__init__()
         self.layer = layer
@@ -51,6 +71,11 @@ class GPTQModule:
         self.quant_bits = quant_bits
         self.weight_format = weight_format
         self.block_size = block_size
+        self.four_over_six = four_over_six
+        self.fixed_grid = normalize_nvfp4_grid(fixed_grid) if fixed_grid is not None else None
+        self.level2_scale_max = float(level2_scale_max)
+        if self.fixed_grid is not None and self.four_over_six:
+            raise ValueError("fixed_grid and adaptive four_over_six are mutually exclusive.")
         # Per-tensor (level-2) NVFP4 scale, set at the start of fasterquant.
         self.weight_scale_2 = None
 
@@ -75,14 +100,27 @@ class GPTQModule:
 
     def compute_quant_params(self, x, bits, sym):
         if self.weight_format == "nvfp4":
-            # Per-block effective scale (block_scale_e4m3 * weight_scale_2).
-            # weight_scale_2 is computed once in fasterquant before this runs.
+            if self.fixed_grid is not None:
+                block_scale = compute_nvfp4_fixed_grid_block_scale(
+                    x, self.weight_scale_2, self.fixed_grid
+                )
+                return block_scale, torch.zeros_like(block_scale)
+            if self.four_over_six:
+                eff_6, eff_4 = compute_nvfp4_block_scale_fouroversix(x, self.weight_scale_2)
+                return (eff_6, eff_4), torch.zeros(1, device=x.device)
             eff_scale = compute_nvfp4_block_scale(x, self.weight_scale_2)
             return eff_scale, torch.zeros_like(eff_scale)
         return compute_scales_with_zero(x, bits=bits, sym=sym)
 
     def quant_dequant(self, x, weight_scale, weight_zero):
         if self.weight_format == "nvfp4":
+            if self.fixed_grid is not None:
+                return nvfp4_fixed_grid_quant_dequant(
+                    x, weight_scale, self.weight_scale_2, self.fixed_grid
+                )
+            if self.four_over_six:
+                eff_6, eff_4 = weight_scale
+                return nvfp4_quant_dequant_fouroversix(x, eff_6, eff_4)
             return nvfp4_quant_dequant(x, weight_scale)
         maxq = torch.tensor(2**self.quant_bits - 1, device=x.device)
         q = torch.clamp(torch.round(x / weight_scale) + weight_zero, 0, maxq)
@@ -96,6 +134,58 @@ class GPTQModule:
         actorder=True,
         sym=True,
     ):
+        if self.nsamples == 0:
+            if self.weight_format != "nvfp4":
+                print_info(
+                    "[warn] nsamples=0, skipping fasterquant (no calibration data routed here)"
+                )
+                scale = torch.zeros(0)
+                zero = torch.zeros(0)
+                return scale, zero, None
+
+            # A routed expert may receive no tokens in the fixed 16-sample
+            # calibration set. It still must be stored as four-bit weight
+            # rather than silently left BF16. With no Hessian information the
+            # well-defined limit is RTN using the exact same fixed-grid
+            # primitive and shared level-2 scale as the observed experts.
+            print_info(
+                "[warn] nsamples=0, applying fixed-grid RTN because no "
+                "calibration tokens were routed to this expert"
+            )
+            w_weight = self.w.float()
+            if self.weight_scale_2 is None:
+                if self.fixed_grid is not None:
+                    self.weight_scale_2 = compute_nvfp4_fixed_grid_weight_scale_2(
+                        w_weight.abs().amax(), self.level2_scale_max
+                    )
+                elif self.four_over_six:
+                    self.weight_scale_2 = compute_nvfp4_weight_scale_2_fouroversix(
+                        w_weight.abs().amax()
+                    )
+                else:
+                    self.weight_scale_2 = compute_nvfp4_weight_scale_2(w_weight.abs().amax())
+
+            if self.fixed_grid is None:
+                raise ValueError(
+                    "The controlled no-activation fallback is implemented only "
+                    "for fixed_grid experiments."
+                )
+            blocks = w_weight.reshape(self.rows, -1, self.block_size)
+            block_scale = compute_nvfp4_fixed_grid_block_scale(
+                blocks, self.weight_scale_2, self.fixed_grid
+            )
+            q_weight = nvfp4_fixed_grid_quant_dequant(
+                blocks, block_scale, self.weight_scale_2, self.fixed_grid
+            ).reshape_as(w_weight)
+            self.layer.weight.data.copy_(q_weight.type_as(self.layer.weight.data))
+            self.w = self.w.cpu()
+            del self.w
+            return (
+                block_scale.squeeze(-1).to(torch.float8_e4m3fn).cpu(),
+                self.weight_scale_2.detach().clone().cpu(),
+                None,
+            )
+
         w_weight = self.w.float()
 
         tick = time.time()
@@ -119,7 +209,16 @@ class GPTQModule:
         # deployment uses one per-tensor scale across the group), keep it and do
         # NOT recompute from this layer's amax alone.
         if self.weight_format == "nvfp4" and self.weight_scale_2 is None:
-            self.weight_scale_2 = compute_nvfp4_weight_scale_2(w_weight.abs().amax())
+            if self.fixed_grid is not None:
+                self.weight_scale_2 = compute_nvfp4_fixed_grid_weight_scale_2(
+                    w_weight.abs().amax(), self.level2_scale_max
+                )
+            elif self.four_over_six:
+                self.weight_scale_2 = compute_nvfp4_weight_scale_2_fouroversix(
+                    w_weight.abs().amax()
+                )
+            else:
+                self.weight_scale_2 = compute_nvfp4_weight_scale_2(w_weight.abs().amax())
 
         scale = []
         zero = []
@@ -208,7 +307,7 @@ class GPTQModule:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         print_info(f" duration: {(time.time() - tick)}")
-        print_info(f" avg loss: {torch.sum(losses).item() / self.nsamples}")
+        print_info(f" avg loss: {torch.sum(losses).item() / max(self.nsamples, 1)}")
 
         target_weight = self.layer.weight.data
         if input_perm is not None:
@@ -227,9 +326,16 @@ class GPTQModule:
 
         if scale == []:
             scale = weight_scale
-            zero = torch.zeros_like(weight_scale)
-        scale = torch.cat(scale, dim=1)
-        zero = torch.cat(zero, dim=1)
+            zero = (
+                torch.zeros_like(weight_scale)
+                if not isinstance(weight_scale, tuple)
+                else torch.zeros(1)
+            )
+        if self.weight_format == "nvfp4" and self.four_over_six:
+            pass  # scale entries are tuples; handled below in the 4/6 branch
+        elif isinstance(scale, list):
+            scale = torch.cat(scale, dim=1)
+            zero = torch.cat(zero, dim=1)
 
         if self.weight_format == "nvfp4":
             # ``scale`` currently holds the effective scale (block_e4m3 *
@@ -237,7 +343,33 @@ class GPTQModule:
             # per-tensor level-2 scale back via the second return value. Move
             # both to CPU so the per-layer scales never pile up on GPU across
             # all transformer layers.
-            block_scale_e4m3 = (scale / self.weight_scale_2).to(torch.float8_e4m3fn).cpu()
+            if self.four_over_six:
+                # With 4/6, scale entries are tuples (eff_6, eff_4). We need to
+                # re-derive the actual block scales from the final compensated
+                # weight using 4/6 selection on the final state.
+                final_w = self.layer.weight.data.float()
+                if input_perm is not None:
+                    final_w = final_w[:, input_perm]
+                final_blocks = final_w.reshape(self.rows, -1, self.block_size)
+                eff_6, eff_4 = compute_nvfp4_block_scale_fouroversix(
+                    final_blocks.reshape(-1, self.block_size), self.weight_scale_2
+                )
+                dq6 = nvfp4_quant_dequant(final_blocks.reshape(-1, self.block_size), eff_6)
+                dq4 = nvfp4_quant_dequant(final_blocks.reshape(-1, self.block_size), eff_4)
+                orig = final_blocks.reshape(-1, self.block_size)
+                err6 = ((dq6 - orig) ** 2).sum(-1, keepdim=True)
+                err4 = ((dq4 - orig) ** 2).sum(-1, keepdim=True)
+                chosen_eff = torch.where(err4 < err6, eff_4, eff_6)
+                chosen_eff = chosen_eff.reshape(self.rows, -1)
+                block_scale_e4m3 = (chosen_eff / self.weight_scale_2).to(torch.float8_e4m3fn).cpu()
+            else:
+                if isinstance(scale, list):
+                    scale = torch.cat(scale, dim=1)
+                block_scale_e4m3 = (
+                    scale.to(torch.float8_e4m3fn).cpu()
+                    if self.fixed_grid is not None
+                    else (scale / self.weight_scale_2).to(torch.float8_e4m3fn).cpu()
+                )
             weight_scale_2 = self.weight_scale_2.detach().clone().cpu()
             losses = losses.cpu()
             q_weight = q_weight.cpu()

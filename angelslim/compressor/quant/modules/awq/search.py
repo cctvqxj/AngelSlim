@@ -31,6 +31,9 @@ class AWQSearch:
         merge_samples=True,
         observer_layer_classes=None,
         low_memory=False,
+        weight_format="int4",
+        four_over_six=False,
+        block_size=16,
     ):
         """
         The implementation of AutoScale from AWQ(https://arxiv.org/pdf/2306.00978.pdf).
@@ -44,6 +47,9 @@ class AWQSearch:
         self.merge_samples = merge_samples
         self.observer_layer_classes = observer_layer_classes
         self.low_memory = low_memory
+        self.weight_format = weight_format
+        self.four_over_six = four_over_six
+        self.block_size = block_size
 
     def _get_out(self, layer_name, act, block, cache):
         if "qkv" in layer_name:
@@ -105,6 +111,9 @@ class AWQSearch:
                             layer.weight,
                             w_bit=self.bits_length,
                             q_group_size=self.group_size,
+                            weight_format=self.weight_format,
+                            four_over_six=self.four_over_six,
+                            block_size=self.block_size,
                         )
                         layer.weight.data.copy_(quant_dequant_weight)
 

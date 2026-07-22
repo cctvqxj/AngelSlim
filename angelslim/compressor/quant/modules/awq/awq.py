@@ -79,6 +79,17 @@ class AWQ:
         self.quant_bits = self.model.quant_config.quant_bit
         self.group_size = self.model.quant_config.quant_algo_info["group_size"]
         self.zero_point = self.model.quant_config.quant_algo_info["zero_point"]
+        self.weight_format = self.model.quant_config.quant_algo_info.get("weight_format", "int4")
+        self.four_over_six = bool(
+            self.model.quant_config.quant_algo_info.get("four_over_six", False)
+        )
+        self.block_size = self.model.quant_config.quant_algo_info.get(
+            "block_size", self.group_size
+        )
+        ignore_layers = self.model.quant_config.quant_algo_info.get("ignore_layers", [])
+        self.scale_attention = not (
+            "self_attn" in ignore_layers and "linear_attn" in ignore_layers
+        )
         self.seq_length = seq_length
         self.hidden_size = hidden_size
         self.model_arch_type = model_arch_type
@@ -96,6 +107,10 @@ class AWQ:
             model_type=self.model_arch_type,
             observer_layer_classes=observer_layer_classes,
             low_memory=low_memory,
+            weight_format=self.weight_format,
+            four_over_six=self.four_over_six,
+            block_size=self.block_size,
+            scale_attention=self.scale_attention,
         )
         self.clip_function = AutoLayerClip(
             weight_bits=self.quant_bits,
@@ -115,6 +130,31 @@ class AWQ:
         print_info(model)
         model.model.model.embed_tokens = model.model.model.embed_tokens.to(device)
         model.model.model.rotary_emb = model.model.model.rotary_emb.to(device)
+
+    @staticmethod
+    def _prepare_layer_kwargs(layer, hidden_states, layer_kwargs):
+        kwargs = dict(layer_kwargs)
+        mask = kwargs.get("attention_mask")
+        if (
+            isinstance(mask, torch.Tensor)
+            and mask.dtype == torch.long
+            and mask.dim() == 2
+            and getattr(layer, "self_attn", None) is not None
+        ):
+            seq_len = hidden_states.shape[1]
+            batch_size = hidden_states.shape[0]
+            causal = torch.full(
+                (seq_len, seq_len),
+                torch.finfo(hidden_states.dtype).min,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            ).triu(1)
+            causal = causal[None, None, :, :].expand(batch_size, 1, -1, -1)
+            padding_mask = mask.to(hidden_states.device)[:, None, None, :] == 0
+            kwargs["attention_mask"] = causal.masked_fill(
+                padding_mask, torch.finfo(hidden_states.dtype).min
+            )
+        return kwargs
 
     @torch.no_grad()
     def run(self, dataloader):
@@ -178,7 +218,12 @@ class AWQ:
                 self.inps = self.inps.to(dev)
             subset = find_layers(layer, layers=self.observer_layer_classes)
 
-            if self.model_arch_type in ["qwen3_moe", "hunyuan_v1_moe", "deepseek_v3"]:
+            if self.model_arch_type in [
+                "qwen3_moe",
+                "qwen3_5_moe",
+                "hunyuan_v1_moe",
+                "deepseek_v3",
+            ]:
                 subset = {
                     **subset,
                     "mlp": layer.mlp,
@@ -206,10 +251,14 @@ class AWQ:
             # being hook
             for j in range(min(self.inps.shape[0], nsamples)):
                 with torch.no_grad():
+                    hidden_states = self.inps[j, :, :].unsqueeze(0).to(dev)
+                    current_layer_kwargs = self._prepare_layer_kwargs(
+                        layer, hidden_states, layer_kwargs
+                    )
                     outs[j, :, :] = (
                         layer(
-                            hidden_states=self.inps[j, :, :].unsqueeze(0).to(dev),
-                            **layer_kwargs,
+                            hidden_states=hidden_states,
+                            **current_layer_kwargs,
                         )[0]
                         .squeeze(1)
                         .to(self.inps.device)
@@ -263,9 +312,11 @@ class AWQ:
 
                 for j in range(min(self.inps.shape[1], nsamples)):
                     with torch.no_grad():
-                        outs[j, :, :] = layer(self.inps[j, :, :].unsqueeze(0), **layer_kwargs)[
-                            0
-                        ].squeeze(1)
+                        hidden_states = self.inps[j, :, :].unsqueeze(0).to(dev)
+                        current_layer_kwargs = self._prepare_layer_kwargs(
+                            layer, hidden_states, layer_kwargs
+                        )
+                        outs[j, :, :] = layer(hidden_states, **current_layer_kwargs)[0].squeeze(1)
             layers[i] = layers[i].cpu()
             layer = layer.cpu()
             torch.cuda.empty_cache()
@@ -373,6 +424,10 @@ class AWQ:
         """
         Saves scales and inserts QDQ modules.
         """
+        if self.weight_format != "int4":
+            raise RuntimeError(
+                "AWQ.convert() only packs INT4. NVFP4-AWQ must use the NVFP4 conversion path."
+            )
         print_info("Start convert model...")
         self._convert_llm()
         print_info("convert model done.")

@@ -706,6 +706,8 @@ NVFP4_E2M1_VALUES = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5,
 NVFP4_E2M1_VALUES_ON_DEVICE = {}
 NVFP4_E2M1_MAX = 6.0
 NVFP4_E4M3_MAX = 448.0
+NVFP4_FIXED_GRID_LEVEL2_MAX = 256.0
+NVFP4_FIXED_GRIDS = ("g6", "g4", "gint")
 
 
 def nvfp4_get_e2m1_values(device):
@@ -734,6 +736,121 @@ def nvfp4_cast_to_e2m1(weight: torch.Tensor):
 
 def nvfp4_dequantize_e2m1(code: torch.Tensor, dtype: torch.dtype = torch.float32):
     return nvfp4_get_e2m1_values(code.device)[(code.to(torch.long) & 0x0F)].to(dtype)
+
+
+def normalize_nvfp4_grid(grid: str | None) -> str:
+    """Normalize names used by the controlled fixed-grid experiment."""
+    aliases = {
+        None: "g6",
+        "g6": "g6",
+        "e2m1_6": "g6",
+        "6": "g6",
+        "g4": "g4",
+        "e2m1_4": "g4",
+        "4": "g4",
+        "gint": "gint",
+        "int4": "gint",
+        "nvint4": "gint",
+    }
+    key = grid.lower() if isinstance(grid, str) else grid
+    if key not in aliases:
+        raise ValueError(
+            f"Unsupported fixed NVFP4 grid {grid!r}; expected one of {NVFP4_FIXED_GRIDS}."
+        )
+    return aliases[key]
+
+
+def nvfp4_grid_divisor(grid: str) -> float:
+    return {"g6": 6.0, "g4": 4.0, "gint": 7.0}[normalize_nvfp4_grid(grid)]
+
+
+def nvfp4_cast_to_grid(weight: torch.Tensor, grid: str) -> torch.Tensor:
+    """Round normalized values to a fixed grid and return packed-nibble codes.
+
+    G6/G4 share the E2M1 codebook. GINT uses signed symmetric integers
+    [-7, 7], encoded as four-bit two's-complement nibbles; code 0x8 (-8) is
+    therefore never emitted.
+    """
+    grid = normalize_nvfp4_grid(grid)
+    if grid in ("g6", "g4"):
+        return nvfp4_cast_to_e2m1(weight)
+    signed = torch.clamp(torch.round(weight.float()), -7, 7).to(torch.int16)
+    return torch.bitwise_and(signed, 0x0F).to(torch.uint8)
+
+
+def nvfp4_dequantize_grid(
+    code: torch.Tensor, grid: str, dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    grid = normalize_nvfp4_grid(grid)
+    if grid in ("g6", "g4"):
+        return nvfp4_dequantize_e2m1(code, dtype=dtype)
+    nibble = torch.bitwise_and(code.to(torch.int16), 0x0F)
+    signed = torch.where(nibble >= 8, nibble - 16, nibble)
+    return signed.to(dtype)
+
+
+def compute_nvfp4_fixed_grid_weight_scale_2(
+    weight_amax: torch.Tensor,
+    level2_scale_max: float = NVFP4_FIXED_GRID_LEVEL2_MAX,
+) -> torch.Tensor:
+    """Common level-2 scale S=max_abs(W)/(6*level2_scale_max).
+
+    The controlled G6/G4/GINT experiment intentionally uses the same formula
+    for every grid. ``level2_scale_max=256`` is the 4/6-compatible setting.
+    """
+    scale2 = weight_amax.float() / NVFP4_E2M1_MAX / float(level2_scale_max)
+    return torch.where(scale2 > 0, scale2, torch.ones_like(scale2))
+
+
+def compute_nvfp4_fixed_grid_block_scale(
+    x_block: torch.Tensor,
+    weight_scale_2: torch.Tensor,
+    grid: str,
+    keep_high_precision: bool = False,
+) -> torch.Tensor:
+    """Return stored E4M3 block scales for a fixed grid."""
+    divisor = nvfp4_grid_divisor(grid)
+    per_block_amax = x_block.abs().amax(dim=-1, keepdim=True).float()
+    per_block_scale = per_block_amax / divisor
+    q_per_block_scale = per_block_scale / weight_scale_2
+    q_per_block_scale = torch.where(
+        per_block_scale > 0, q_per_block_scale, torch.ones_like(q_per_block_scale)
+    )
+    if not keep_high_precision:
+        finfo = torch.finfo(torch.float8_e4m3fn)
+        q_per_block_scale = q_per_block_scale.clamp(min=finfo.min, max=finfo.max).to(
+            torch.float8_e4m3fn
+        )
+    return q_per_block_scale
+
+
+def nvfp4_fixed_grid_quant_dequant(
+    x: torch.Tensor,
+    block_scale_e4m3: torch.Tensor,
+    weight_scale_2: torch.Tensor,
+    grid: str,
+) -> torch.Tensor:
+    """Fake quantize/dequantize using the exact stored E4M3 scale."""
+    effective_scale = block_scale_e4m3.float() * weight_scale_2
+    code = nvfp4_cast_to_grid(x.float() / effective_scale, grid)
+    return nvfp4_dequantize_grid(code, grid, dtype=torch.float32) * effective_scale
+
+
+def pack_nvfp4_fixed_grid_codes(code: torch.Tensor) -> torch.Tensor:
+    if code.shape[-1] % 2 != 0:
+        raise ValueError("The last code dimension must be even for uint4 packing.")
+    return (code[..., 1::2] << 4) | code[..., 0::2]
+
+
+def unpack_nvfp4_fixed_grid_codes(packed: torch.Tensor) -> torch.Tensor:
+    code = torch.empty(
+        (*packed.shape[:-1], packed.shape[-1] * 2),
+        dtype=torch.uint8,
+        device=packed.device,
+    )
+    code[..., 0::2] = packed & 0x0F
+    code[..., 1::2] = packed >> 4
+    return code
 
 
 def compute_nvfp4_weight_scale_2(weight_amax: torch.Tensor) -> torch.Tensor:
@@ -779,6 +896,70 @@ def nvfp4_quant_dequant(x: torch.Tensor, eff_scale: torch.Tensor):
     return nvfp4_dequantize_e2m1(code, dtype=torch.float32) * eff_scale
 
 
+# ---------------------------------------------------------------------------
+# Four Over Six (4/6) adaptive block scaling primitives.
+#
+# Instead of always scaling blocks so that the max value maps to 6 (standard
+# NVFP4), 4/6 tries both scale=6 and scale=4 for each block and picks the one
+# with lower MSE. This avoids the FP4 "dead zone" between 4 and 6 for blocks
+# whose near-maximal values would otherwise land there.
+# ---------------------------------------------------------------------------
+NVFP4_E4M3_MAX_FOUROVERSIX = 256.0
+
+
+def compute_nvfp4_weight_scale_2_fouroversix(weight_amax: torch.Tensor) -> torch.Tensor:
+    """Per-tensor scale for 4/6: amax / 6 / 256 (not 448).
+
+    Using 256 instead of 448 ensures that blocks containing the tensor's largest
+    values can still select scale=4 without overflowing E4M3 (256 * 6/4 = 384 < 448).
+    """
+    scale2 = weight_amax.float() / NVFP4_E2M1_MAX / NVFP4_E4M3_MAX_FOUROVERSIX
+    return torch.where(scale2 > 0, scale2, torch.ones_like(scale2))
+
+
+def compute_nvfp4_block_scale_fouroversix(
+    x_block: torch.Tensor,
+    weight_scale_2: torch.Tensor,
+    keep_high_precision: bool = False,
+) -> tuple:
+    """Compute effective scales for BOTH scale=6 and scale=4 paths.
+
+    Returns (eff_scale_6, eff_scale_4) both shaped [..., 1].
+    """
+    per_block_amax = x_block.abs().amax(dim=-1, keepdim=True).float()
+
+    scale_6 = per_block_amax / NVFP4_E2M1_MAX
+    q_scale_6 = scale_6 / weight_scale_2
+    q_scale_6 = torch.where(scale_6 > 0, q_scale_6, torch.ones_like(q_scale_6))
+
+    scale_4 = per_block_amax / 4.0
+    q_scale_4 = scale_4 / weight_scale_2
+    q_scale_4 = torch.where(scale_4 > 0, q_scale_4, torch.ones_like(q_scale_4))
+
+    if not keep_high_precision:
+        finfo = torch.finfo(torch.float8_e4m3fn)
+        q_scale_6 = q_scale_6.clamp(min=finfo.min, max=finfo.max).to(torch.float8_e4m3fn).float()
+        q_scale_4 = q_scale_4.clamp(min=finfo.min, max=finfo.max).to(torch.float8_e4m3fn).float()
+
+    return q_scale_6 * weight_scale_2, q_scale_4 * weight_scale_2
+
+
+def nvfp4_quant_dequant_fouroversix(
+    x: torch.Tensor, eff_scale_6: torch.Tensor, eff_scale_4: torch.Tensor
+):
+    """Fake-quantize with 4/6: try both scales, pick lower MSE per block.
+
+    x shape: [rows, block_size] or [rows, 1] (single column during GPTQ).
+    eff_scale_6, eff_scale_4: [rows, 1].
+    Returns dequantized tensor using per-block optimal scale.
+    """
+    dq6 = nvfp4_quant_dequant(x, eff_scale_6)
+    dq4 = nvfp4_quant_dequant(x, eff_scale_4)
+    err6 = ((dq6 - x.float()) ** 2).sum(dim=-1, keepdim=True)
+    err4 = ((dq4 - x.float()) ** 2).sum(dim=-1, keepdim=True)
+    return torch.where(err4 < err6, dq4, dq6)
+
+
 class NVFP4QDQModule(torch.nn.Module):
     def __init__(
         self,
@@ -788,6 +969,7 @@ class NVFP4QDQModule(torch.nn.Module):
         bias: torch.nn.Parameter,
         block_size: int = 16,
         input_scale: Optional[torch.nn.Parameter] = None,
+        fixed_grid: str | None = None,
     ):
         super().__init__()
         # Define conversion tables
@@ -802,6 +984,7 @@ class NVFP4QDQModule(torch.nn.Module):
         self.weight_scale_2 = torch.nn.Parameter(weight_scale_2, requires_grad=False)
         self.bias = bias
         self.block_size = block_size
+        self.fixed_grid = normalize_nvfp4_grid(fixed_grid) if fixed_grid is not None else None
         if input_scale is not None:
             self.input_scale = torch.nn.Parameter(input_scale, requires_grad=False)
         else:
@@ -880,8 +1063,12 @@ class NVFP4QDQModule(torch.nn.Module):
 
         if keep_high_precision:
             return scaled_weight
-        # Cast weights to fp4
-        q_weight = self._cast_fp4(scaled_weight)
+        # Cast weights to the checkpoint's four-bit grid.
+        q_weight = (
+            nvfp4_cast_to_grid(scaled_weight, self.fixed_grid)
+            if self.fixed_grid is not None
+            else self._cast_fp4(scaled_weight)
+        )
         # Pack weights
         packed_weight = (q_weight[..., 1::2] << 4) | q_weight[..., 0::2]
 
@@ -1050,7 +1237,12 @@ class NVFP4QDQModule(torch.nn.Module):
             unpacked[..., 0::2] = input & 0x0F
 
             unpacked = unpacked.reshape(-1)
-            unpacked = self.get_e2m1_values(input.device)[unpacked.long()]
+            if self.fixed_grid is None:
+                unpacked = self.get_e2m1_values(input.device)[unpacked.long()]
+            else:
+                unpacked = nvfp4_dequantize_grid(
+                    unpacked.to(torch.uint8), self.fixed_grid, dtype=dtype
+                )
 
             return unpacked.reshape(unpacked_shape)
 
