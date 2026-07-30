@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 from argparse import ArgumentParser
+from copy import deepcopy
 
 import torch
 from safetensors.torch import safe_open, save_file
@@ -14,6 +15,47 @@ FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 EXPERT_PATTERN = re.compile(
     r"model\.layers\.(\d+)\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)$"
 )
+
+BF16_CONFIG_EXTRA_KEYS = {
+    "mtp_loss_scaling_factor",
+    "mtp_num_layers",
+    "num_nextn_predict_layers",
+    "num_nextn_predict_tokens",
+}
+
+
+def is_bf16_config_extra_key(key):
+    """Return whether a missing bf16 config key is safe to append.
+
+    The merge output is primarily an NVFP4 checkpoint: its tensor shapes must
+    match the NVFP4 architecture config.  We therefore only supplement fields
+    that are known metadata for optional MTP/nextn layers and never override an
+    existing NVFP4 key.
+    """
+
+    key_lower = key.lower()
+    return (
+        key_lower in BF16_CONFIG_EXTRA_KEYS
+        or key_lower.startswith("mtp_")
+        or key_lower.startswith("multi_token")
+        or "nextn" in key_lower
+    )
+
+
+def merge_model_configs(nvfp4_config, bf16_config):
+    """Merge configs with NVFP4 as the source of truth.
+
+    bf16 contributes only whitelisted keys that are absent from NVFP4.  This
+    prevents bf16 architecture fields from silently changing layer dimensions
+    while still allowing optional metadata such as MTP settings to be carried
+    over.
+    """
+
+    config = deepcopy(nvfp4_config)
+    for key, value in bf16_config.items():
+        if key not in config and is_bf16_config_extra_key(key):
+            config[key] = deepcopy(value)
+    return config
 
 
 def compute_expert_input_scales(statistics_path, num_hidden_layers):
@@ -192,6 +234,21 @@ def build_hf_quant_config(num_hidden_layers):
     }
 
 
+def build_final_model_config(nvfp4_config, bf16_config):
+    """Build config.json for the finalized ModelOpt-compatible checkpoint.
+
+    Architecture fields remain sourced from the NVFP4 checkpoint, while the
+    quantization schema is rebuilt unconditionally to describe the tensors
+    produced by this merge (static NVFP4 activation scales and FP8 KV cache).
+    The input checkpoint may contain an intermediate AngelSlim/GPTQ schema,
+    which must not leak into the finalized deployment config.
+    """
+
+    config = merge_model_configs(nvfp4_config, bf16_config)
+    config["quantization_config"] = build_quantization_config(config["num_hidden_layers"])
+    return config
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument("--nvfp4_modelpath", type=str, required=True)
@@ -207,12 +264,12 @@ def main():
     output_path = args.output_path
     os.makedirs(output_path, exist_ok=True)
 
-    # Merge config.json: nvfp4 as base, bf16 overrides (union, bf16 wins on conflict)
+    # Merge config.json with NVFP4 as source of truth.
     with open(os.path.join(nvfp4_path, "config.json"), "r") as f:
         nvfp4_config = json.load(f)
     with open(os.path.join(bf16_path, "config.json"), "r") as f:
         bf16_config = json.load(f)
-    config = {**nvfp4_config, **bf16_config}
+    config = build_final_model_config(nvfp4_config, bf16_config)
     num_hidden_layers = config["num_hidden_layers"]
     print(f"num_hidden_layers: {num_hidden_layers}")
 
@@ -280,25 +337,29 @@ def main():
         )
     print("Saved model.safetensors.index.json")
 
-    # Write config.json: bf16 config + quantization_config
-    quantization_config = build_quantization_config(num_hidden_layers)
-    config["quantization_config"] = quantization_config
+    # Write config.json using the NVFP4 architecture plus a freshly generated
     with open(os.path.join(output_path, "config.json"), "w") as f:
         json.dump(config, f, indent=2)
-    print("Saved config.json (bf16 base + quantization_config)")
+    print("Saved config.json (nvfp4 architecture + ModelOpt quantization_config)")
 
-    # Write hf_quant_config.json
-    hf_quant_config = build_hf_quant_config(num_hidden_layers)
-    with open(os.path.join(output_path, "hf_quant_config.json"), "w") as f:
-        json.dump(hf_quant_config, f, indent=2)
-    print("Saved hf_quant_config.json")
+    # Write hf_quant_config.json.
+    src_hf_quant_config = os.path.join(nvfp4_path, "hf_quant_config.json")
+    dst_hf_quant_config = os.path.join(output_path, "hf_quant_config.json")
+    if os.path.exists(src_hf_quant_config):
+        shutil.copy2(src_hf_quant_config, dst_hf_quant_config)
+        print("Copied hf_quant_config.json from nvfp4 model")
+    else:
+        hf_quant_config = build_hf_quant_config(num_hidden_layers)
+        with open(dst_hf_quant_config, "w") as f:
+            json.dump(hf_quant_config, f, indent=2)
+        print("Saved generated hf_quant_config.json")
 
     # Copy other files from bf16_modelpath (excluding safetensors, index, config.json)
     print("Copying auxiliary files from bf16 model...")
     for item in os.listdir(bf16_path):
         if item.endswith(".safetensors"):
             continue
-        if item in ("model.safetensors.index.json", "config.json"):
+        if item in ("model.safetensors.index.json", "config.json", "hf_quant_config.json"):
             continue
         dst = os.path.join(output_path, item)
         if os.path.exists(dst):

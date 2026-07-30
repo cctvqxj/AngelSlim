@@ -30,9 +30,11 @@ from .....utils import (
     find_parent_layer_and_sub_name,
     print_info,
 )
+from ...core.quant_func import reduce_block_padding
 from ...core.save import copy_mtp_layers_if_present
 from ...modules.catcher import Catcher
 from ...modules.helper_layer import (
+    NVFP4_E2M1_MAX,
     GPTQQuantLinear,
     NVFP4QDQModule,
     compute_nvfp4_weight_scale_2,
@@ -366,6 +368,32 @@ class GPTQ:
                 f"{shared_scale_2.item():.6g} across {len(names)} layers"
             )
 
+    def _rtn_nvfp4_scales(self, weight, weight_scale_2):
+        """Round-to-nearest NVFP4 scales for a weight that GPTQ skipped.
+
+        Args:
+            weight: fp32/bf16 weight [out, in]; ``in`` need not be block-aligned.
+            weight_scale_2: per-tensor level-2 scale (shared for fused gate/up).
+        Returns:
+            (block_scale_e4m3 [out, in/block_size] float8_e4m3fn,
+             weight_scale_2 [scalar] float32) both on CPU.
+        """
+        w = reduce_block_padding(weight.float(), block_sizes={-1: self.block_size})
+        w = w.view(*w.shape[:-1], -1, self.block_size)
+        per_block_amax = w.abs().amax(dim=-1).float()
+        per_block_scale = per_block_amax / NVFP4_E2M1_MAX
+        q_per_block_scale = per_block_scale / weight_scale_2
+        q_per_block_scale = torch.where(
+            per_block_scale > 0,
+            q_per_block_scale,
+            torch.ones_like(q_per_block_scale),
+        )
+        finfo = torch.finfo(torch.float8_e4m3fn)
+        block_scale_e4m3 = (
+            q_per_block_scale.clamp(min=finfo.min, max=finfo.max).to(torch.float8_e4m3fn).cpu()
+        )
+        return block_scale_e4m3, weight_scale_2.detach().float().cpu()
+
     @torch.no_grad()
     def run(self, dataloader):
         for model_module in self.layers:
@@ -500,10 +528,33 @@ class GPTQ:
                     and self._get_expert_idx_from_name(name) is not None
                     and self.gptq[name].nsamples == 0
                 ):
-                    print_info(
-                        f"Skip {name} because no calibration samples were "
-                        f"routed to this local expert layer."
-                    )
+                    quant_name = f"{self.layers_block_name}.{i}.{name}"
+                    if self.weight_format == "nvfp4":
+                        gptq_layer = self.gptq[name]
+                        weight_scale_2 = gptq_layer.weight_scale_2
+                        if weight_scale_2 is None:
+                            # Non-fused layer (e.g. down_proj): derive its own.
+                            weight_scale_2 = compute_nvfp4_weight_scale_2(
+                                gptq_layer.w.abs().amax()
+                            )
+                        block_scale_e4m3, weight_scale_2 = self._rtn_nvfp4_scales(
+                            gptq_layer.layer.weight.data, weight_scale_2
+                        )
+                        self.quantizers[quant_name] = (
+                            block_scale_e4m3,
+                            torch.zeros_like(block_scale_e4m3, dtype=torch.float32),
+                        )
+                        self.nvfp4_weight_scales_2[quant_name] = weight_scale_2
+                        print_info(
+                            f"RTN-pack {name} (no calibration samples routed): "
+                            f"NVFP4 round-to-nearest, weight left uncompensated."
+                        )
+                    else:
+                        print_info(
+                            f"Skip {name} because no calibration samples were "
+                            f"routed to this local expert layer; it stays bf16 "
+                            f"(int4 RTN fallback not implemented)."
+                        )
                     self.gptq[name].free()
                     continue
                 print_info(f"Quant {name} ,nsamples: {self.gptq[name].nsamples}...")
@@ -650,7 +701,6 @@ class GPTQ:
         print_info("Packing NVFP4 model...")
         layers = find_layers(model, layers=self.model.observer_layer_classes)
 
-
         try:
             import ctypes
 
@@ -663,6 +713,7 @@ class GPTQ:
                     pass
 
         except Exception:
+
             def _malloc_trim():
                 pass
 
