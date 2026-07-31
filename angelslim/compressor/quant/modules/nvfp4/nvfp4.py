@@ -84,6 +84,7 @@ class NVFP4:
             weights_scaling_factor_2 = weights_scaling_factor_2.to(per_block_scale.device)
         q_per_block_scale = per_block_scale / weights_scaling_factor_2
         # Set all zero values in scale to 1.0
+
         q_per_block_scale[per_block_scale == 0] = 1.0
         # Convert to torch.float8_e4m3fn
         if not keep_high_precision:
