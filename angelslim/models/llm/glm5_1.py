@@ -38,7 +38,13 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaNaiveMoe
+
+try:
+    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaNaiveMoe
+except ImportError:
+    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
+        GlmMoeDsaExperts as GlmMoeDsaNaiveMoe,
+    )
 
 from ...compressor.quant.core import PTQSaveVllmHF
 from ...utils.utils import find_parent_layer_and_sub_name, print_info
