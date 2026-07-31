@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import inspect
 import json
 import os
 import shutil
@@ -55,7 +56,26 @@ def _extract_hidden_states(output):
     return output
 
 
+def _extract_hidden_states_and_topk(output, preserves_topk_indices):
+    """Extract a decoder layer's hidden states and optional cross-layer DSA state.
+
+    GLM-5.2 decoder layers return ``(hidden_states, topk_indices)``.  The
+    ``topk_indices`` value must be carried into the next decoder layer because
+    a ``shared`` DSA layer reuses the most recent ``full`` layer's indices.
+    Other model families may also return tuples, but their second item has a
+    different meaning, so it is only retained for layers that explicitly
+    accept ``prev_topk_indices``.
+    """
+    hidden_states = _extract_hidden_states(output)
+    if preserves_topk_indices and isinstance(output, tuple) and len(output) > 1:
+        return hidden_states, output[1]
+    return hidden_states, None
+
+
 __all__ = ["GPTQ"]
+
+# Model types requiring saved-config compatibility patches for serving.
+SERVING_CONFIG_PATCH_MODEL_TYPES = ("hy_v3", "glm_moe_dsa")
 
 
 class GPTQ:
@@ -237,9 +257,52 @@ class GPTQ:
                 aligned_kwargs[key] = value
         return hidden_states, aligned_kwargs
 
-    def _forward_layer(self, layer, hidden_states, kwargs):
+    @staticmethod
+    def _uses_cross_layer_topk_indices(layer):
+        """Whether ``layer`` participates in GLM-5.2 DSA state propagation."""
+        # Keep this compatible with remote-code/newer Transformers decoder
+        # layers without tying GPTQ to a concrete GLM class.
+        try:
+            parameters = inspect.signature(layer.forward).parameters
+        except (TypeError, ValueError):
+            return False
+        if "prev_topk_indices" in parameters:
+            return True
+
+        config = getattr(layer, "config", None)
+        return getattr(config, "model_type", None) == "glm_moe_dsa" and any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        )
+
+    def _align_prev_topk_indices(self, prev_topk_indices, hidden_states):
+        if not isinstance(prev_topk_indices, torch.Tensor):
+            return prev_topk_indices
+
+        # GLM DSA indices have shape [batch, query_seq_len, index_topk].
+        # Keep their query dimension aligned if GPTQ's sequence-length guard
+        # truncated the corresponding hidden states.
+        prev_topk_indices = self._truncate_tensor_dim(
+            prev_topk_indices,
+            hidden_states.shape[1],
+            dim=1,
+        )
+        return prev_topk_indices.to(hidden_states.device)
+
+    def _forward_layer(self, layer, hidden_states, kwargs, prev_topk_indices=None):
         hidden_states, kwargs = self._align_layer_input(hidden_states, kwargs)
-        return _extract_hidden_states(layer(hidden_states=hidden_states, **kwargs))
+        kwargs = dict(kwargs)
+        preserves_topk_indices = self._uses_cross_layer_topk_indices(layer)
+        if preserves_topk_indices:
+            # The first captured layer may already have stored this key with a
+            # None value. Always overwrite it with the state belonging to this
+            # calibration sample.
+            kwargs["prev_topk_indices"] = self._align_prev_topk_indices(
+                prev_topk_indices,
+                hidden_states,
+            )
+
+        output = layer(hidden_states=hidden_states, **kwargs)
+        return _extract_hidden_states_and_topk(output, preserves_topk_indices)
 
     @staticmethod
     def _get_expert_idx_from_name(name):
@@ -436,8 +499,12 @@ class GPTQ:
         ]
 
         outs = [torch.zeros_like(x) for x in inps]
+        # GLM-5.2 DSA state is sample-specific. A full indexer layer produces
+        # these indices and following shared layers reuse them.
+        prev_topk_indices_list = [None] * nsamples
         if "gptaq" in self.quant_algo:
             native_inps = [x.clone().detach() for x in inps]
+            native_prev_topk_indices_list = [None] * nsamples
         # begin the gptq process
         print_info("Ready.")
 
@@ -495,10 +562,17 @@ class GPTQ:
                     )
 
                 # native hook forward
+                next_native_topk_indices_list = [None] * nsamples
                 for j in range(nsamples):
                     with torch.no_grad():
-                        outs[j] = self._forward_layer(layer, native_inps[j], layer_kwargs_list[j])
+                        outs[j], next_native_topk_indices_list[j] = self._forward_layer(
+                            layer,
+                            native_inps[j],
+                            layer_kwargs_list[j],
+                            native_prev_topk_indices_list[j],
+                        )
                 native_inps = [x.clone().detach() for x in outs]
+                native_prev_topk_indices_list = next_native_topk_indices_list
 
                 print_info("Native HOOK Step{}".format(j))
                 for h in native_handles:
@@ -511,7 +585,12 @@ class GPTQ:
             # hook forward
             for j in range(nsamples):
                 with torch.no_grad():
-                    outs[j] = self._forward_layer(layer, inps[j], layer_kwargs_list[j])
+                    outs[j], _ = self._forward_layer(
+                        layer,
+                        inps[j],
+                        layer_kwargs_list[j],
+                        prev_topk_indices_list[j],
+                    )
 
             print_info("HOOK Step{}".format(j))
             for h in handles:
@@ -591,9 +670,15 @@ class GPTQ:
                 )
                 self.gptq[name].free()
 
+            next_topk_indices_list = [None] * nsamples
             for j in range(nsamples):
                 with torch.no_grad():
-                    outs[j] = self._forward_layer(layer, inps[j], layer_kwargs_list[j])
+                    outs[j], next_topk_indices_list[j] = self._forward_layer(
+                        layer,
+                        inps[j],
+                        layer_kwargs_list[j],
+                        prev_topk_indices_list[j],
+                    )
 
             for name in self.gptq:
                 del self.gptq[name].layer
@@ -605,6 +690,7 @@ class GPTQ:
                 torch.cuda.empty_cache()
             gc.collect()
             inps, outs = outs, inps
+            prev_topk_indices_list = next_topk_indices_list
             print_info("GPTQ end layer {}\n".format(i))
 
         del inps, outs
@@ -825,7 +911,7 @@ class GPTQ:
         with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
 
-        if config.get("model_type") not in ("hy_v3", "glm_moe_dsa"):
+        if config.get("model_type") not in SERVING_CONFIG_PATCH_MODEL_TYPES:
             return
 
         rope_parameters = config.get("rope_parameters")
