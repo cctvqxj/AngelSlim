@@ -88,6 +88,46 @@ class GPTQModule:
         q = torch.clamp(torch.round(x / weight_scale) + weight_zero, 0, maxq)
         return weight_scale * (q - weight_zero)
 
+    @torch.no_grad()
+    def rtn_quantize(self, group_size=-1, sym=True):
+        """Apply weight-only round-to-nearest quantization without calibration.
+
+        This is used when an expert receives no routed calibration tokens, so
+        no Hessian is available for GPTQ error compensation. The returned
+        scales and zero points use the same layout as ``fasterquant`` and can
+        be consumed by the normal GPTQ packing path.
+        """
+        if self.weight_format != "int4":
+            raise ValueError("rtn_quantize currently supports only int4 weights")
+
+        weight = self.w.float()
+        effective_group_size = group_size if group_size != -1 else self.columns
+        scales = []
+        zeros = []
+        quantized_groups = []
+
+        for start in range(0, self.columns, effective_group_size):
+            group = weight[:, start : start + effective_group_size]
+            scale, zero = self.compute_quant_params(
+                group,
+                bits=self.quant_bits,
+                sym=sym,
+            )
+            scales.append(scale)
+            zeros.append(zero)
+            quantized_groups.append(self.quant_dequant(group, scale, zero))
+
+        quantized_weight = torch.cat(quantized_groups, dim=1)
+        self.layer.weight.data.copy_(quantized_weight.type_as(self.layer.weight.data))
+
+        scale = torch.cat(scales, dim=1)
+        zero = torch.cat(zeros, dim=1)
+        self.w = self.w.cpu()
+        del self.w
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return scale, zero, None
+
     def fasterquant(
         self,
         blocksize=128,
