@@ -22,8 +22,8 @@ compression:
     quant_method:
       weight: "per-group"
       group_size: 16          # NVFP4 micro-scaling block (fixed at 16; -1 also resolves to 16)
-      dequant_to_bf16: false
-      actorder: false
+      dequant_to_bf16: false  
+      actorder: false        
     ignore_layers:            # Quantize routed experts only; skip everything else.
       - "lm_head"
       - "self_attn"             # all MLA projections + DSA indexer (wq_b/wk/weights_proj)

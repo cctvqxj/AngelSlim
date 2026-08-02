@@ -22,7 +22,7 @@ compression:
       weight: "per-group"
       group_size: 16          # NVFP4 micro-scaling block (fixed at 16; -1 also resolves to 16)
       dequant_to_bf16: false
-      actorder: true         
+      actorder: true
       share_gate_up_weight_scale_2: true  # share one per-tensor scale_2 across each fused gate/up (q/k/v) group; matches fused-GEMM deployment
     ignore_layers:         # Skip quantization for these layers
       - "lm_head"
