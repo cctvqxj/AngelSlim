@@ -16,9 +16,10 @@
 
 GLM-5 combines a DeepSeek-V3.2-style MLA attention + DSA indexer with an
 HYV3-style MoE whose expert weights are stored as fused 3-D ``nn.Parameter``
-tensors. This adapter targets **weight-only NVFP4-GPTQ quantization of the
-routed experts only** (gate/up/down per expert); attention, the DSA indexer,
-the router, shared experts, and the leading dense MLP layers are left intact.
+tensors. This adapter targets **weight-only GPTQ quantization of the routed
+experts** (gate/up/down per expert), including packed INT4-GPTQ and NVFP4-GPTQ.
+Attention, the DSA indexer, the router, shared experts, and the leading dense
+MLP layers are left intact.
 
 The input checkpoint is expected to be a plain **bf16** model
 
@@ -153,9 +154,11 @@ class GlmExpertsWithLinear(GlmMoeDsaNaiveMoe):
                 object.__setattr__(child, "_angelslim_moe_parent_expert", expert_layer)
             gate = expert_layer["gate_proj"](current_state)
             up = expert_layer["up_proj"](current_state)
-            current_hidden_states = (self.act_fn(gate).float() * up.float()).to(
-                expert_layer["down_proj"].weight.dtype
-            )
+            # Keep the activation dtype independent of the down projection's
+            # storage format. Packed GPTQ modules expose qweight/scales instead
+            # of a floating-point ``weight`` attribute, while their forward
+            # still consumes the gate/up activation dtype.
+            current_hidden_states = (self.act_fn(gate).float() * up.float()).to(up.dtype)
             current_hidden_states = expert_layer["down_proj"](current_hidden_states)
             current_hidden_states = current_hidden_states.float() * expert_scores.float()
             final_hidden_states.index_add_(
@@ -546,8 +549,8 @@ class GLM5_1(BaseLLMModel):
     def get_observer_layers(self):
         """Collect only the routed-expert projections; ignore everything else.
 
-        Weight-only NVFP4-GPTQ targets the MoE experts. Attention (MLA), the
-        DSA indexer, the router gate, shared experts, the leading dense MLP
+        Weight-only INT4/NVFP4 GPTQ targets the MoE experts. Attention (MLA),
+        the DSA indexer, the router gate, shared experts, the leading dense MLP
         layers, embeddings, and lm_head are all routed to ignore_layers.
         """
         from ...utils.utils import find_layers

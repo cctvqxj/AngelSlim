@@ -252,6 +252,7 @@ class WQLinearGEMM(nn.Module):
 
 class GPTQQuantLinear(nn.Module):
     QUANT_TYPE = "cuda"
+    INT4_PACKING_CHUNK_SIZE = 256
 
     def __init__(
         self,
@@ -318,9 +319,87 @@ class GPTQQuantLinear(nn.Module):
     def post_init(self):
         pass
 
-    def pack(self, linear, scales, zeros, g_idx=None):
-        w = linear.weight.data.clone()
+    def _pack_int4_weight_chunked(self, weight, scale_zeros):
+        """Quantize and pack INT4 weights in K-dimension chunks.
 
+        The checkpoint layout matches the legacy GPTQ implementation: eight
+        consecutive INT4 values along K are packed into one int32 value.  The
+        chunked implementation avoids both the per-column Python loop and the
+        full-size intermediate tensors used by a naive vectorized version.
+        """
+        pack_factor = 32 // self.bits
+        if self.infeatures % pack_factor != 0:
+            raise ValueError(
+                f"infeatures={self.infeatures} must be divisible by {pack_factor} "
+                "for INT4 packing"
+            )
+
+        chunk_size = max(pack_factor, int(self.INT4_PACKING_CHUNK_SIZE))
+        chunk_size = chunk_size // pack_factor * pack_factor
+        qweight = torch.empty(
+            (self.infeatures // pack_factor, self.outfeatures),
+            dtype=torch.int32,
+            device="cpu",
+        )
+        shifts = torch.arange(
+            0,
+            32,
+            self.bits,
+            dtype=torch.int32,
+            device=weight.device,
+        ).view(1, 1, pack_factor)
+
+        for start in range(0, self.infeatures, chunk_size):
+            end = min(start + chunk_size, self.infeatures)
+            group_idx = self.g_idx[start:end].to(device=weight.device, dtype=torch.long)
+            chunk_scales = self.scales.index_select(0, group_idx).t()
+            chunk_scale_zeros = scale_zeros.index_select(0, group_idx).t()
+            intweight = torch.round((weight[:, start:end] + chunk_scale_zeros) / chunk_scales).to(
+                torch.int32
+            )
+
+            packed = (
+                (
+                    (intweight & self.maxq).view(
+                        self.outfeatures,
+                        -1,
+                        pack_factor,
+                    )
+                    << shifts
+                )
+                .sum(dim=2, dtype=torch.int32)
+                .t()
+                .contiguous()
+                .cpu()
+            )
+            qweight[start // pack_factor : end // pack_factor].copy_(packed)
+
+        return qweight
+
+    def _pack_int4_zeros(self, zeros):
+        """Pack eight zero points into each int32 using the GPTQ layout."""
+        pack_factor = 32 // self.bits
+        if zeros.shape[1] % pack_factor != 0:
+            raise ValueError(
+                f"outfeatures={zeros.shape[1]} must be divisible by {pack_factor} "
+                "for INT4 zero-point packing"
+            )
+
+        shifts = torch.arange(
+            0,
+            32,
+            self.bits,
+            dtype=torch.int32,
+            device=zeros.device,
+        ).view(1, 1, pack_factor)
+        zeros_int = ((zeros.to(torch.int32) - 1) & self.maxq).view(
+            zeros.shape[0],
+            zeros.shape[1] // pack_factor,
+            pack_factor,
+        )
+        return (zeros_int << shifts).sum(dim=2, dtype=torch.int32).cpu()
+
+    def pack(self, linear, scales, zeros, g_idx=None):
         self.g_idx = g_idx.clone() if g_idx is not None else self.g_idx
 
         scales = scales.t().contiguous()
@@ -330,6 +409,12 @@ class GPTQQuantLinear(nn.Module):
         if getattr(linear, "bias", None) is not None:
             self.bias = linear.bias.clone().to(dtype=linear.weight.dtype)
 
+        if self.bits == 4:
+            self.qweight = self._pack_int4_weight_chunked(linear.weight.data, scale_zeros)
+            self.qzeros = self._pack_int4_zeros(zeros)
+            return
+
+        w = linear.weight.data.clone()
         intweight = []
         for idx in range(self.infeatures):
             intweight.append(

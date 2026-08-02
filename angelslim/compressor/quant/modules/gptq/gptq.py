@@ -628,11 +628,24 @@ class GPTQ:
                             f"RTN-pack {name} (no calibration samples routed): "
                             f"NVFP4 round-to-nearest, weight left uncompensated."
                         )
+                    elif isinstance(self.gptq[name], GPTQModule):
+                        scale, zero, input_perm = self.gptq[name].rtn_quantize(
+                            group_size=self.group_size,
+                            sym=self.sym,
+                        )
+                        self.quantizers[quant_name] = (
+                            scale.cpu(),
+                            zero.cpu(),
+                        )
+                        print_info(
+                            f"RTN-pack {name} (no calibration samples routed): "
+                            f"INT4 round-to-nearest, weight left uncompensated."
+                        )
                     else:
                         print_info(
                             f"Skip {name} because no calibration samples were "
                             f"routed to this local expert layer; it stays bf16 "
-                            f"(int4 RTN fallback not implemented)."
+                            f"(RTN fallback is only implemented for GPTQ)."
                         )
                     self.gptq[name].free()
                     continue
