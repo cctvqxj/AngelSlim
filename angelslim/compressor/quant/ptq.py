@@ -28,7 +28,7 @@ from ...utils import (
 from ..compressor_factory import CompressorFactory
 from ..transform import TransformFactory
 from .core import PTQHook
-from .modules import AWQ, FP8, GPTQ, INT8, NVFP4, W4A8INT8, LeptoFP8, SmoothQuant
+from .modules import AWQ, FP8, GPTQ, INT8, MXFP4, NVFP4, W4A8INT8, LeptoFP8, SmoothQuant
 
 __all__ = ["PTQ"]
 
@@ -67,6 +67,7 @@ class PTQ:
             "fp8" in self.quant_algo
             or "int8" in self.quant_algo
             or ("nvfp4" in self.quant_algo and not is_gptq)
+            or ("mxfp4" in self.quant_algo and not is_gptq)
         ):
             # Add ptq observer hook
             self.ptq_hook = PTQHook(self.quant_model)
@@ -132,6 +133,8 @@ class PTQ:
                 model_arch_type=model_arch_type,
                 low_memory=self.quant_model.quant_config.low_memory,
             )
+        elif "mxfp4" in self.quant_algo:
+            self.mxfp4 = MXFP4(self.quant_model)
         elif "nvfp4" in self.quant_algo:
             self.nvfp4 = NVFP4(self.quant_model)
         else:
@@ -155,6 +158,8 @@ class PTQ:
             self.fp8.run(dataloader)
         elif "int8" in self.quant_algo:
             self.int8.run(dataloader)
+        elif "mxfp4" in self.quant_algo:
+            self.mxfp4.run(dataloader)
         elif "nvfp4" in self.quant_algo:
             self.nvfp4.run(dataloader)
         else:
@@ -274,14 +279,18 @@ class PTQ:
         self.set_meta_weights_info(self.quant_model.model)
         print_info(f"Meta weight:{self.get_meta_weights_info(self.quant_model.model)}")
 
-        # For nvfp4 weight-only, skip observer-based scale collection
-        # (scales are computed directly from weights in post_process)
+        # Data-free FP4 weight-only methods compute scales directly from weights.
         is_nvfp4_weight_only = (
             "nvfp4" in self.quant_algo
             and self.quant_model.quant_config.quant_algo_info.get("weight_only", False)
         )
+        is_mxfp4_weight_only = (
+            "mxfp4" in self.quant_algo
+            and self.quant_model.quant_config.quant_algo_info.get("weight_only", False)
+        )
+        is_fp4_weight_only = is_nvfp4_weight_only or is_mxfp4_weight_only
 
-        if not is_nvfp4_weight_only:
+        if not is_fp4_weight_only:
             # 1. get act, weight and kv-cache scale
             for name, sub_layer in self.ptq_hook.quant_layers_dict.items():
                 if (
@@ -375,7 +384,10 @@ class PTQ:
                 sub_layer = sub_layer.to("cpu")
             elif pack_on_gpu:
                 sub_layer = sub_layer.to(pack_device)
-            if "nvfp4" in self.quant_algo:
+            if "mxfp4" in self.quant_algo:
+                self.mxfp4.post_process(sub_layer, name)
+                qdq_module = self.quant_model.get_mxfp4_qdq_module(sub_layer, name)
+            elif "nvfp4" in self.quant_algo:
                 self.nvfp4.post_process(sub_layer, name)
                 qdq_module = self.quant_model.get_nvfp4_qdq_module(sub_layer, name)
             else:

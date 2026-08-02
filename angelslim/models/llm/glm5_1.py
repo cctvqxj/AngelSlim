@@ -17,9 +17,9 @@
 GLM-5 combines a DeepSeek-V3.2-style MLA attention + DSA indexer with an
 HYV3-style MoE whose expert weights are stored as fused 3-D ``nn.Parameter``
 tensors. This adapter targets **weight-only GPTQ quantization of the routed
-experts** (gate/up/down per expert), including packed INT4-GPTQ and NVFP4-GPTQ.
-Attention, the DSA indexer, the router, shared experts, and the leading dense
-MLP layers are left intact.
+experts** (gate/up/down per expert), including INT4-GPTQ and NVFP4/MXFP4 with
+or without GPTQ error compensation. Attention, the DSA indexer, the router,
+shared experts, and the leading dense MLP layers are left intact.
 
 The input checkpoint is expected to be a plain **bf16** model
 
@@ -549,8 +549,9 @@ class GLM5_1(BaseLLMModel):
     def get_observer_layers(self):
         """Collect only the routed-expert projections; ignore everything else.
 
-        Weight-only INT4/NVFP4 GPTQ targets the MoE experts. Attention (MLA),
-        the DSA indexer, the router gate, shared experts, the leading dense MLP
+        Weight-only INT4-GPTQ and NVFP4/MXFP4 quantization target the MoE
+        experts. Attention (MLA), the
+        DSA indexer, the router gate, shared experts, the leading dense MLP
         layers, embeddings, and lm_head are all routed to ignore_layers.
         """
         from ...utils.utils import find_layers

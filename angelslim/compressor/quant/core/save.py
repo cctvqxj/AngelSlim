@@ -61,6 +61,12 @@ def sanitize_generation_config(generation_config):
         )
 
 
+def add_mxfp4_config_metadata(config, quantization_config):
+    """Record MXFP4 scale encoding and the precision used for copied MTP layers."""
+    quantization_config["scale_fmt"] = "ue8m0"
+    config.mtp_quant_algo = "bf16"
+
+
 def _load_source_weight_map(source_path):
     """Return {weight_name: shard_file} for a source checkpoint."""
     index_path = os.path.join(source_path, "model.safetensors.index.json")
@@ -270,6 +276,18 @@ class PTQVLMSaveVllmHF(PTQSaveBase):
                 "dynamic": False,
                 "type": "int",
             }
+        elif "mxfp4" in self.quant_model.quant_config.quant_algo:
+            quant_format = "naive-quantized"
+            group_size = self.quant_model.quant_config.quant_algo_info["block_size"]
+            trtllm_config["quantization"]["quant_algo"] = "MXFP4"
+            trtllm_config["quantization"]["group_size"] = group_size
+            act_config = None
+            weight_config = {
+                "num_bits": 4,
+                "group_size": group_size,
+                "dynamic": False,
+                "type": "float",
+            }
         elif "nvfp4" in self.quant_model.quant_config.quant_algo:
             quant_format = "naive-quantized"
             group_size = self.quant_model.quant_config.quant_algo_info["block_size"]
@@ -315,6 +333,12 @@ class PTQVLMSaveVllmHF(PTQSaveBase):
         ):
             quantization_config["transform_config"] = (
                 self.quant_model.quant_config.transform_config
+            )
+
+        if "mxfp4" in self.quant_model.quant_config.quant_algo:
+            add_mxfp4_config_metadata(
+                self.quant_model.get_model().config,
+                quantization_config,
             )
 
         quant_dict = {"quantization_config": quantization_config}
@@ -376,6 +400,18 @@ class PTQSaveVllmHF(PTQSaveBase):
                 "dynamic": False,
                 "type": "int",
             }
+        elif "mxfp4" in self.quant_model.quant_config.quant_algo:
+            quant_format = "naive-quantized"
+            group_size = self.quant_model.quant_config.quant_algo_info["block_size"]
+            trtllm_config["quantization"]["quant_algo"] = "MXFP4"
+            trtllm_config["quantization"]["group_size"] = group_size
+            act_config = None
+            weight_config = {
+                "num_bits": 4,
+                "group_size": group_size,
+                "dynamic": False,
+                "type": "float",
+            }
         elif "nvfp4" in self.quant_model.quant_config.quant_algo:
             quant_format = "naive-quantized"
             group_size = self.quant_model.quant_config.quant_algo_info["block_size"]
@@ -435,6 +471,12 @@ class PTQSaveVllmHF(PTQSaveBase):
         ):
             quantization_config["transform_config"] = (
                 self.quant_model.quant_config.transform_config
+            )
+
+        if "mxfp4" in self.quant_model.quant_config.quant_algo:
+            add_mxfp4_config_metadata(
+                self.quant_model.get_model().config,
+                quantization_config,
             )
 
         quant_dict = {"quantization_config": quantization_config}

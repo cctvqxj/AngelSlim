@@ -23,7 +23,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ..compressor.quant.core import QuantConfig
-from ..compressor.quant.modules import NVFP4QDQModule, QDQModule
+from ..compressor.quant.modules import MXFP4QDQModule, NVFP4QDQModule, QDQModule
 from ..utils import (
     common_prefix,
     decide_device_for_distributed,
@@ -247,6 +247,20 @@ class BaseLLMModel(metaclass=ABCMeta):
 
     def get_moe_qdq_module(self, sub_layer, name):
         return sub_layer
+
+    def get_mxfp4_qdq_module(self, sub_layer, name):
+        weight_scale = self.weight_scales_dict.get(name)
+        block_size = self.quant_config.quant_algo_info["block_size"]
+        if self.deploy_backend in ["vllm", "huggingface", "trtllm", "tensorrt"]:
+            return MXFP4QDQModule(
+                weight=sub_layer.weight,
+                weight_scale=weight_scale,
+                bias=sub_layer.bias,
+                block_size=block_size,
+            )
+        raise NotImplementedError(
+            f"current {self.deploy_backend} deploy_backend does not support MXFP4"
+        )
 
     def get_nvfp4_qdq_module(self, sub_layer, name):
         act_scale, weight_scale, weight_scale_2 = None, None, None

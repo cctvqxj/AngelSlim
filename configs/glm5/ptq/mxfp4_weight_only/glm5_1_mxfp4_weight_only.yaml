@@ -1,0 +1,29 @@
+global:
+  save_path: ./output
+
+model:
+  name: GLM5_1
+  model_path: zai-org/GLM-5.1
+  trust_remote_code: true
+  low_cpu_mem_usage: true
+  use_cache: false
+  torch_dtype: auto
+  device_map: cpu
+
+compression:
+  name: PTQ
+  quantization:
+    name: mxfp4_weight_only
+    bits: 4
+    cpu_convert: false
+    quant_method:
+      weight: per-group
+      group_size: 32
+    ignore_layers:
+      - lm_head
+      - self_attn
+      - mlp.gate
+      - mlp.shared_experts
+      - mlp.gate_proj
+      - mlp.up_proj
+      - mlp.down_proj
