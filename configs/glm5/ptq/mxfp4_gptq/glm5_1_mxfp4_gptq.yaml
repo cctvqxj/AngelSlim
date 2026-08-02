@@ -1,0 +1,40 @@
+global:
+  save_path: ./results
+
+model:
+  name: GLM5_1
+  model_path: zai-org/GLM-5.1
+  trust_remote_code: true
+  low_cpu_mem_usage: true
+  use_cache: false
+  torch_dtype: auto
+  device_map: cpu
+  enable_expert_parallel: true
+
+compression:
+  name: PTQ
+  quantization:
+    name: mxfp4_gptq
+    bits: 4
+    quant_method:
+      weight: per-group
+      group_size: 32
+      dequant_to_bf16: false
+      actorder: false
+    ignore_layers:
+      - lm_head
+      - self_attn
+      - mlp.gate
+      - mlp.shared_experts
+      - mlp.gate_proj
+      - mlp.up_proj
+      - mlp.down_proj
+
+dataset:
+  name: TextDataset
+  data_path: /apdcephfs_hldy2/share_300532381/xiaojingqi/data/Nemotron-SFT/calib_hybrid_2048.jsonl
+  max_seq_length: 2048
+  num_samples: 512
+  batch_size: 1
+
+  

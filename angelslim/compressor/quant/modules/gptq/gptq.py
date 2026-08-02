@@ -32,13 +32,16 @@ from .....utils import (
     print_info,
 )
 from ...core.quant_func import reduce_block_padding
-from ...core.save import copy_mtp_layers_if_present
+from ...core.save import add_mxfp4_config_metadata, copy_mtp_layers_if_present
 from ...modules.catcher import Catcher
 from ...modules.helper_layer import (
     NVFP4_E2M1_MAX,
     GPTQQuantLinear,
+    MXFP4QDQModule,
     NVFP4QDQModule,
+    compute_mxfp4_block_scale,
     compute_nvfp4_weight_scale_2,
+    encode_mxfp4_scale,
 )
 from .gptaq_module import GPTAQModule
 from .gptq_module import GPTQModule
@@ -88,7 +91,7 @@ class GPTQ:
         self.quant_bits = self.model.quant_config.quant_bit
         self.group_size = self.model.quant_config.quant_algo_info["group_size"]
         self.ignore_layers = self.model.quant_config.quant_algo_info["ignore_layers"]
-        # Weight number format backend: "int4" (default) or "nvfp4".
+        # Weight number format backend: "int4", "nvfp4", or "mxfp4".
         self.weight_format = self.model.quant_config.quant_algo_info.get("weight_format", "int4")
         self.block_size = self.model.quant_config.quant_algo_info.get(
             "block_size", self.group_size
@@ -158,7 +161,7 @@ class GPTQ:
     def get_actorder_prev_names(self, name, subset):
         # Enable act-order for *_proj layers whose input permutation can be
         # folded into the output channels of the preceding gate_proj/up_proj.
-        # This keeps the (NVFP4 / int4) group blocks physically contiguous
+        # This keeps the (NVFP4 / MXFP4 / int4) group blocks physically contiguous
         # along K even after column reordering, so no g_idx is needed.
         if not name.endswith("down_proj"):
             return []
@@ -457,6 +460,11 @@ class GPTQ:
         )
         return block_scale_e4m3, weight_scale_2.detach().float().cpu()
 
+    def _rtn_mxfp4_scales(self, weight):
+        """Return E8M0 MXFP4 scales for a weight that GPTQ could not calibrate."""
+        scale = compute_mxfp4_block_scale(weight.detach(), self.block_size)
+        return encode_mxfp4_scale(scale).cpu()
+
     @torch.no_grad()
     def run(self, dataloader):
         for model_module in self.layers:
@@ -628,6 +636,16 @@ class GPTQ:
                             f"RTN-pack {name} (no calibration samples routed): "
                             f"NVFP4 round-to-nearest, weight left uncompensated."
                         )
+                    elif self.weight_format == "mxfp4":
+                        encoded_scale = self._rtn_mxfp4_scales(self.gptq[name].layer.weight.data)
+                        self.quantizers[quant_name] = (
+                            encoded_scale,
+                            torch.zeros_like(encoded_scale),
+                        )
+                        print_info(
+                            f"RTN-pack {name} (no calibration samples routed): "
+                            f"MXFP4 round-to-nearest, weight left uncompensated."
+                        )
                     else:
                         print_info(
                             f"Skip {name} because no calibration samples were "
@@ -773,6 +791,36 @@ class GPTQ:
             force_layer_back_to_cpu=True,
         )
 
+    def _convert_mxfp4(self):
+        """Pack GPTQ-compensated weights as MXFP4 + E8M0 scales."""
+        model = self.model.model
+        model.cpu()
+        print_info("Packing MXFP4 model...")
+        layers = find_layers(model, layers=self.model.observer_layer_classes)
+
+        with tctl.threadpool_limits(limits=1):
+            names = list(self.quantizers.keys())
+            pbar = tqdm(names, leave=True)
+            for name in pbar:
+                pbar.set_description(f"Packing {name}...", refresh=True)
+                if name not in layers:
+                    continue
+                sub_layer = layers[name].cpu()
+                encoded_scale, _zero = self.quantizers[name]
+                qdq_module = MXFP4QDQModule(
+                    weight=sub_layer.weight,
+                    weight_scale=encoded_scale.cpu(),
+                    bias=sub_layer.bias,
+                    block_size=self.block_size,
+                )
+                parent_layer, sub_name = find_parent_layer_and_sub_name(model, name)
+                setattr(parent_layer, sub_name, qdq_module)
+                layers.pop(name, None)
+                self.quantizers.pop(name, None)
+
+        gc.collect()
+        print_info("MXFP4 model packed.")
+
     def _convert_nvfp4(self):
         """Insert NVFP4QDQModule for each quantized layer (real packing).
 
@@ -844,7 +892,15 @@ class GPTQ:
         Saves scales and inserts QDQ modules.
         """
         print_info("Start convert model...")
-        if self.weight_format == "nvfp4":
+        if self.weight_format == "mxfp4":
+            if self.dequant_to_bf16:
+                print_info(
+                    "dequant_to_bf16=True: skip MXFP4 packing, keep "
+                    "fake-quantized bf16 weights."
+                )
+            else:
+                self._convert_mxfp4()
+        elif self.weight_format == "nvfp4":
             if self.dequant_to_bf16:
                 print_info(
                     "dequant_to_bf16=True: skip NVFP4 packing, keep "
@@ -961,6 +1017,17 @@ class GPTQ:
                 except Exception:
                     self.model.model.config.quantization_config = None
             self.model.model.config.torch_dtype = "bfloat16"
+        elif self.weight_format == "mxfp4":
+            self.model.model.config.quantization_config = {
+                "quant_method": "mxfp4",
+                "kv_cache_scheme": None,
+                "group_size": self.block_size,
+                "exclude_modules": self.ignore_layers,
+            }
+            add_mxfp4_config_metadata(
+                self.model.model.config,
+                self.model.model.config.quantization_config,
+            )
         elif self.weight_format == "nvfp4":
             # Packed modelopt-style NVFP4 checkpoint (two-level scaling).
             self.model.model.config.quantization_config = {

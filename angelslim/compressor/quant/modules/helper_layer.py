@@ -736,6 +736,80 @@ def nvfp4_dequantize_e2m1(code: torch.Tensor, dtype: torch.dtype = torch.float32
     return nvfp4_get_e2m1_values(code.device)[(code.to(torch.long) & 0x0F)].to(dtype)
 
 
+# ---------------------------------------------------------------------------
+# MXFP4 module-level primitives (OCP E2M1 + E8M0 block scale).
+#
+# MXFP4 uses the same E2M1 values and nibble packing as NVFP4, but each
+# 32-value block owns a power-of-two E8M0 scale. There is no per-tensor
+# weight_scale_2 and no activation input_scale in weight-only checkpoints.
+# ---------------------------------------------------------------------------
+MXFP4_BLOCK_SIZE = 32
+MXFP4_E8M0_BIAS = 127
+
+
+def compute_mxfp4_block_scale(
+    weight: torch.Tensor, block_size: int = MXFP4_BLOCK_SIZE
+) -> torch.Tensor:
+    """Return the decoded power-of-two scale for each MXFP4 block."""
+    if weight.shape[-1] % block_size != 0:
+        raise ValueError(
+            f"MXFP4 requires the last dimension ({weight.shape[-1]}) "
+            f"to be divisible by block_size={block_size}."
+        )
+    blocks = weight.float().reshape(*weight.shape[:-1], -1, block_size)
+    block_amax = blocks.abs().amax(dim=-1)
+    target = (block_amax / NVFP4_E2M1_MAX).clamp_min(1e-30)
+    scale = torch.pow(2.0, torch.ceil(torch.log2(target)))
+    return torch.where(block_amax == 0, torch.ones_like(scale), scale)
+
+
+def encode_mxfp4_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Encode positive power-of-two scales as OCP E8M0 bytes."""
+    if torch.any(scale <= 0):
+        raise ValueError("MXFP4 scales must be positive.")
+    return (torch.log2(scale.float()) + MXFP4_E8M0_BIAS).to(torch.uint8)
+
+
+def decode_mxfp4_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Decode OCP E8M0 bytes into float32 power-of-two scales."""
+    return torch.pow(2.0, scale.to(torch.int32).float() - MXFP4_E8M0_BIAS)
+
+
+def mxfp4_quant_dequant(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: int = MXFP4_BLOCK_SIZE,
+) -> torch.Tensor:
+    """Quantize-dequantize through the exact MXFP4 E2M1 grid."""
+    original_shape = weight.shape
+    if weight.shape[-1] % block_size == 0 and scale.shape[-1] == weight.shape[-1] // block_size:
+        blocks = weight.float().reshape(*weight.shape[:-1], -1, block_size)
+        effective_scale = scale.float().unsqueeze(-1)
+        scaled = blocks / effective_scale
+        codes = nvfp4_cast_to_e2m1(scaled)
+        values = nvfp4_dequantize_e2m1(codes, dtype=torch.float32)
+        return (values * effective_scale).reshape(original_shape)
+
+    # GPTQ quantizes one column at a time while reusing the scale of the
+    # enclosing 32-value block. In that path scale already broadcasts to x.
+    scaled = weight.float() / scale.float()
+    codes = nvfp4_cast_to_e2m1(scaled)
+    values = nvfp4_dequantize_e2m1(codes, dtype=torch.float32)
+    return values * scale.float()
+
+
+def mxfp4_pack(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: int = MXFP4_BLOCK_SIZE,
+) -> torch.Tensor:
+    """Pack MXFP4 E2M1 values, two uint4 codes per uint8 byte."""
+    blocks = weight.float().reshape(*weight.shape[:-1], -1, block_size)
+    scaled = (blocks / scale.float().unsqueeze(-1)).reshape(weight.shape)
+    codes = nvfp4_cast_to_e2m1(scaled)
+    return ((codes[..., 1::2] << 4) | codes[..., 0::2]).contiguous()
+
+
 def compute_nvfp4_weight_scale_2(weight_amax: torch.Tensor) -> torch.Tensor:
     """Per-tensor (level-2) FP32 scale: amax / 6 / 448.
 
@@ -777,6 +851,51 @@ def nvfp4_quant_dequant(x: torch.Tensor, eff_scale: torch.Tensor):
     scaled = x.float() / eff_scale
     code = nvfp4_cast_to_e2m1(scaled)
     return nvfp4_dequantize_e2m1(code, dtype=torch.float32) * eff_scale
+
+
+class MXFP4QDQModule(torch.nn.Module):
+    """Packed weight-only MXFP4 linear module."""
+
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: Optional[torch.nn.Parameter],
+        block_size: int = MXFP4_BLOCK_SIZE,
+    ):
+        super().__init__()
+        if block_size != MXFP4_BLOCK_SIZE:
+            raise ValueError(f"MXFP4 block_size must be {MXFP4_BLOCK_SIZE}, got {block_size}.")
+        self.shape = weight.shape
+        self.dtype = weight.dtype
+        self.block_size = block_size
+        self.weight_scale = torch.nn.Parameter(
+            weight_scale.to(device=weight.device, dtype=torch.uint8), requires_grad=False
+        )
+        decoded_scale = decode_mxfp4_scale(self.weight_scale)
+        self.weight = torch.nn.Parameter(
+            mxfp4_pack(weight, decoded_scale, block_size), requires_grad=False
+        )
+        self.bias = bias
+
+    def dequantize(self) -> torch.Tensor:
+        codes = torch.empty(
+            (*self.weight.shape[:-1], self.weight.shape[-1] * 2),
+            dtype=torch.uint8,
+            device=self.weight.device,
+        )
+        codes[..., 0::2] = self.weight & 0x0F
+        codes[..., 1::2] = self.weight >> 4
+        values = nvfp4_dequantize_e2m1(codes, dtype=torch.float32)
+        scale = decode_mxfp4_scale(self.weight_scale).unsqueeze(-1)
+        return (
+            (values.reshape(*values.shape[:-1], -1, self.block_size) * scale)
+            .reshape(self.shape)
+            .to(self.dtype)
+        )
+
+    def forward(self, x):
+        return torch.nn.functional.linear(x, self.dequantize(), bias=self.bias)
 
 
 class NVFP4QDQModule(torch.nn.Module):

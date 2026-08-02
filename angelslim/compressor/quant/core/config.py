@@ -174,6 +174,44 @@ class QuantConfig:
                 "dequant_to_bf16": quantization_args.quant_method.get("dequant_to_bf16", False),
                 "actorder": quantization_args.quant_method.get("actorder", True),
             }
+        elif "mxfp4_gptq" in self.quant_algo:
+            self.act_observer = None
+            self.weight_observer = None
+            self.kv_cache_observer = None
+            block_size = (
+                32
+                if quantization_args.quant_method["group_size"] == -1
+                else quantization_args.quant_method["group_size"]
+            )
+            if block_size != 32:
+                raise ValueError(f"MXFP4 group_size must be 32, got {block_size}.")
+            self.quant_algo_info = {
+                "group_size": block_size,
+                "block_size": block_size,
+                "ignore_layers": quantization_args.ignore_layers,
+                "weight_format": "mxfp4",
+                "checkpoint_format": "mxfp4",
+                "dequant_to_bf16": quantization_args.quant_method.get("dequant_to_bf16", False),
+                "actorder": quantization_args.quant_method.get("actorder", True),
+                "w": f"mxfp4_{weight_quant_method}",
+            }
+        elif "mxfp4_weight_only" in self.quant_algo:
+            self.act_observer = None
+            self.weight_observer = AbsmaxPertensorObserver
+            self.kv_cache_observer = None
+            block_size = (
+                32
+                if quantization_args.quant_method["group_size"] == -1
+                else quantization_args.quant_method["group_size"]
+            )
+            if block_size != 32:
+                raise ValueError(f"MXFP4 group_size must be 32, got {block_size}.")
+            self.quant_algo_info = {
+                "w": f"mxfp4_{weight_quant_method}",
+                "ignore_layers": quantization_args.ignore_layers,
+                "block_size": block_size,
+                "weight_only": True,
+            }
         elif "nvfp4_gptq" in self.quant_algo or "nvfp4_gptaq" in self.quant_algo:
             # NVFP4 weight format optimized with the GPTQ error-compensation
             # loop (weight-only). Shares the GPTQ runner with int4_gptq; the

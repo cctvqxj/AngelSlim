@@ -20,8 +20,11 @@ import torch
 from .....utils import get_tensor_item, print_info
 from ...core import compute_scales_with_zero
 from ..helper_layer import (
+    compute_mxfp4_block_scale,
     compute_nvfp4_block_scale,
     compute_nvfp4_weight_scale_2,
+    encode_mxfp4_scale,
+    mxfp4_quant_dequant,
     nvfp4_quant_dequant,
 )
 
@@ -36,9 +39,9 @@ class GPTQModule:
         Args:
             layer: Full-precision torch.nn.Module to quantize (Linear)
             quant_bits: Quantization bitwidth (2-8 bits, default=4)
-            weight_format: "int4" (default, uniform) or "nvfp4" (E2M1 grid +
-                two-level scale). Routes compute_quant_params / quant_dequant.
-            block_size: NVFP4 micro-scaling block size (nvfp4 only).
+            weight_format: "int4" (uniform), "nvfp4" (E2M1 + two-level
+                scale), or "mxfp4" (E2M1 + E8M0 block scale).
+            block_size: FP4 micro-scaling block size (16 for NVFP4, 32 for MXFP4).
         """
         super(GPTQModule, self).__init__()
         self.layer = layer
@@ -74,6 +77,9 @@ class GPTQModule:
         self.h += inp.matmul(inp.t())
 
     def compute_quant_params(self, x, bits, sym):
+        if self.weight_format == "mxfp4":
+            scale = compute_mxfp4_block_scale(x, self.block_size)
+            return scale, torch.zeros_like(scale)
         if self.weight_format == "nvfp4":
             # Per-block effective scale (block_scale_e4m3 * weight_scale_2).
             # weight_scale_2 is computed once in fasterquant before this runs.
@@ -82,6 +88,8 @@ class GPTQModule:
         return compute_scales_with_zero(x, bits=bits, sym=sym)
 
     def quant_dequant(self, x, weight_scale, weight_zero):
+        if self.weight_format == "mxfp4":
+            return mxfp4_quant_dequant(x, weight_scale, self.block_size)
         if self.weight_format == "nvfp4":
             return nvfp4_quant_dequant(x, weight_scale)
         maxq = torch.tensor(2**self.quant_bits - 1, device=x.device)
@@ -230,6 +238,21 @@ class GPTQModule:
             zero = torch.zeros_like(weight_scale)
         scale = torch.cat(scale, dim=1)
         zero = torch.cat(zero, dim=1)
+
+        if self.weight_format == "mxfp4":
+            encoded_scale = encode_mxfp4_scale(scale).cpu()
+            zero = torch.zeros_like(encoded_scale)
+            losses = losses.cpu()
+            q_weight = q_weight.cpu()
+            w_weight = w_weight.cpu()
+            hessian = hessian.cpu()
+            hinv = hinv.cpu()
+            del losses, q_weight, w_weight, hessian, hinv
+            self.w = self.w.cpu()
+            del self.w
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return encoded_scale, zero, input_perm
 
         if self.weight_format == "nvfp4":
             # ``scale`` currently holds the effective scale (block_e4m3 *
