@@ -668,3 +668,71 @@ bash scripts/ptq/run_vllm_quant_for_glm5.sh --help
 ```
 
 脚本开启 `set -euo pipefail`，任一实际执行的阶段失败都会立即中断。
+
+---
+
+## 四、HY4 系列脚本
+
+### 1. `run_hy4_mxfp4_rtn_fp8_ue8m0.sh` — Data-free MXFP4 RTN + FP8 UE8M0
+
+该流水线不需要校准数据：
+
+- 主模型 routed experts 使用 MXFP4 RTN。
+- 其余受支持的主模型 Linear 和 MTP 权重转换为 FP8 E4M3，并使用
+  128×128 UE8M0 scale。
+- 不执行 GPTQ，也不需要 GPTQ 校准数据。
+
+入口和默认配置：
+
+```text
+scripts/ptq/run_hy4_mxfp4_rtn_fp8_ue8m0.sh
+configs/Hy4/ptq/mxfp4_rtn_fp8_ue8m0/hy4_mxfp4_rtn.yaml
+```
+
+运行前必须设置：
+
+| 变量 | 作用 |
+| --- | --- |
+| `BF16_MODEL_PATH` | 源 BF16 checkpoint |
+| `STAGE1_MODEL` | MXFP4 RTN 中间 checkpoint 的空目录 |
+| `FINAL_MODEL` | 最终混合量化 checkpoint 的空目录 |
+
+可选变量：
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `CONFIG` | 上述默认 RTN YAML | Stage 1 MXFP4 RTN 配置 |
+| `LOG_DIR` | `${FINAL_MODEL}/logs` | 各阶段日志目录 |
+| `NUM_WORKERS` | `8` | Stage 1 和 Stage 2 的转换 worker 数量 |
+
+运行方式：
+
+```bash
+BF16_MODEL_PATH=... \
+STAGE1_MODEL=... \
+FINAL_MODEL=... \
+bash scripts/ptq/run_hy4_mxfp4_rtn_fp8_ue8m0.sh
+```
+
+支持的开关：
+
+| 开关 | 作用 |
+| --- | --- |
+| `--cpu` | 使用 CPU 执行转换 |
+| `--skip-rtn` | 复用已有 Stage 1 checkpoint |
+| `--skip-fp8` | 跳过 FP8 UE8M0 转换 |
+| `--skip-config-sync` | 跳过 BF16 配置和辅助文件同步 |
+| `--skip-validate` | 跳过最终 checkpoint 校验 |
+| `--validate-only` | 仅校验已有 Stage 1 和最终 checkpoint |
+| `--full-duplicate-check` | 对同尺寸分片执行完整 SHA256 重复检查 |
+
+完整流程依次执行：
+
+1. 流式读取 BF16 safetensors，将主模型 routed experts 转为 MXFP4 RTN。
+2. 保留 MXFP4 experts，将其余目标 Linear 和 MTP 转为 FP8 UE8M0。
+3. 从 BF16 checkpoint 同步模型配置和缺失的辅助文件。
+4. 校验 tensor layout、dtype、索引、分片、链接、配置和 MXFP4 数据一致性。
+
+脚本要求 Stage 1 和最终输出目录为空，避免覆盖已有 checkpoint。运行日志
+分别写入 `stage1_mxfp4_rtn.log`、`stage2_fp8_ue8m0.log`、
+`stage3_sync_config.log` 和 `stage4_validate.log`。
